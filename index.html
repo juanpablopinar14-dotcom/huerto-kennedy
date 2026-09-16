@@ -22,8 +22,8 @@
 <script>
   // 1) Reemplaza estos 2 valores con los de tu proyecto Supabase (Settings > API).
   // 2) Si los dejas como están, la app corre en MODO LOCAL (localStorage), útil para probar.
-  const SUPABASE_URL      = "https://ojromdqrkkvnyrahvczu.supabase.co";      // ej: https://abcd.supabase.co
-  const SUPABASE_ANON_KEY = "sb_publishable_5jZCEacnP6r9giS3c8U2NQ_x6s9ZRkg"; // clave anon (pública)
+  const SUPABASE_URL      = "PEGAR_SUPABASE_URL";      // ej: https://abcd.supabase.co
+  const SUPABASE_ANON_KEY = "PEGAR_SUPABASE_ANON_KEY"; // clave anon (pública)
 </script>
 
 <header class="bg-[var(--verde2)] text-white sticky top-0 z-20 shadow">
@@ -160,6 +160,10 @@ const store = {
   async saveConversion(c){
     if(useSB){ const row={...c}; if(!row.id)delete row.id; const {data,error}=await sb.from('conversiones').upsert(row).select().single(); if(error)throw error; return data; }
     let arr=await this.conversiones(); if(!c.id){c.id=uid();arr.push(c);}else arr=arr.map(x=>x.id===c.id?{...x,...c}:x); LS.set('conversiones',arr); return c;
+  },
+  async borrarConversion(id){
+    if(useSB){ const {error}=await sb.from('conversiones').delete().eq('id',id); if(error)throw error; return; }
+    LS.set('conversiones',(await this.conversiones()).filter(x=>x.id!==id));
   },
 
   // ---- MEMORIA / COSTO PONDERADO ----
@@ -427,14 +431,14 @@ async function analizarImagenAnthropic(b64){
 }
 function paintFoto(v){
   const key=getAIKey(); const prov=getAIProv();
-  const listo = store.mode==='supabase' || !!key;
+  const listo = !!key;  // la foto usa la key directa (Gemini/Anthropic) en cualquier modo
   v.innerHTML=`<div class="bg-white rounded-xl shadow-sm p-4">
     <p class="text-sm mb-3">Saca o sube una foto del ticket/listado. La IA lo lee y llena el carrito para que revises antes de cobrar.</p>
     <input id="foto" type="file" accept="image/*" capture="environment" class="block w-full text-sm mb-3">
     <button id="btnFoto" class="px-4 py-2 rounded-lg bg-[var(--verde)] text-white font-bold text-sm ${listo?'':'opacity-50'}" ${listo?'':'disabled'}>Analizar foto</button>
     ${listo?'':'<p class="text-xs text-amber-600 mt-3">⚠️ Configura la IA abajo para poder leer fotos en modo local.</p>'}
     <div id="fotoStatus" class="text-sm text-slate-500 mt-3"></div>
-    <details class="mt-4 text-xs text-slate-500" ${listo?'':'open'}><summary class="cursor-pointer select-none">⚙️ Configurar IA (modo local)</summary>
+    <details class="mt-4 text-xs text-slate-500" ${listo?'':'open'}><summary class="cursor-pointer select-none">⚙️ Configurar IA</summary>
       <div class="mt-2 space-y-2">
         <div>
           <div class="font-medium mb-1">Proveedor</div>
@@ -463,13 +467,7 @@ function paintFoto(v){
     $('#fotoStatus').textContent='Leyendo imagen… (puede tardar unos segundos)';
     try{
       const b64=await fileToB64(f);
-      let parsed;
-      if(store.mode==='supabase'){
-        const {data,error}=await sb.functions.invoke('analizar-venta',{body:{image:b64, productos:PRODS.map(p=>({id:p.id,codigo:p.codigo,nombre:p.nombre,formato:p.formato,precio:p.precio_venta}))}});
-        if(error)throw error; parsed=data;
-      } else {
-        parsed = getAIProv()==='anthropic' ? await analizarImagenAnthropic(b64) : await analizarImagenGemini(b64);
-      }
+      const parsed = getAIProv()==='anthropic' ? await analizarImagenAnthropic(b64) : await analizarImagenGemini(b64);
       const items=parsed.items||[];
       if(!items.length){$('#fotoStatus').textContent='No se detectaron productos. Prueba con más luz o más cerca.';return;}
       let cargados=0; const sinMatch=[];
@@ -491,24 +489,42 @@ const fileToB64=f=>new Promise((res,rej)=>{const r=new FileReader();r.onload=()=
    ============================================================ */
 async function renderProductos(){
   await refreshProds();
+  let sortKey='nombre', sortDir=1;
   main.innerHTML=`
    <div class="bg-white rounded-xl shadow-sm p-3">
-    <div class="flex flex-wrap gap-2 items-center mb-3">
+    <div class="flex flex-wrap gap-2 items-center mb-1">
       <input id="qp" placeholder="Buscar…" class="border rounded-lg px-3 py-2 text-sm flex-1 min-w-[160px]">
       <button id="addProd" class="px-3 py-2 rounded-lg bg-[var(--verde)] text-white text-sm font-bold">+ Producto</button>
     </div>
+    <div class="text-xs text-slate-400 mb-2">Toca un título de columna para ordenar (por ej. Margen).</div>
     <div class="overflow-x-auto">
     <table class="w-full text-sm">
       <thead class="text-left text-slate-400 border-b">
-        <tr><th class="py-2 pr-2">Producto</th><th class="pr-2">Código</th><th class="pr-2">Formato</th>
-        <th class="pr-2 text-right">P. venta</th><th class="pr-2 text-right">P. compra</th><th class="pr-2 text-right">Margen</th><th></th></tr>
+        <tr>
+          <th data-sort="nombre" class="th py-2 pr-2 cursor-pointer select-none">Producto</th>
+          <th data-sort="codigo" class="th pr-2 cursor-pointer select-none">Código</th>
+          <th data-sort="formato" class="th pr-2 cursor-pointer select-none">Formato</th>
+          <th data-sort="precio_venta" class="th pr-2 text-right cursor-pointer select-none">P. venta</th>
+          <th data-sort="precio_compra" class="th pr-2 text-right cursor-pointer select-none">P. compra</th>
+          <th data-sort="margen" class="th pr-2 text-right cursor-pointer select-none">Margen</th>
+          <th></th></tr>
       </thead><tbody id="prodBody"></tbody>
     </table></div>
    </div>`;
+  const margen=p=>p.precio_compra?Math.round((1-p.precio_compra/p.precio_venta)*100):null;
+  const arrow=k=> k===sortKey ? (sortDir>0?' ▲':' ▼') : '';
   const paint=(f='')=>{
     const q=f.toLowerCase();
-    $('#prodBody').innerHTML=PRODS.filter(p=>p.nombre.toLowerCase().includes(q)||String(p.codigo||'').includes(q)).map(p=>{
-      const mg = p.precio_compra? Math.round((1-p.precio_compra/p.precio_venta)*100):null;
+    let rows=PRODS.filter(p=>p.nombre.toLowerCase().includes(q)||String(p.codigo||'').includes(q));
+    rows.sort((a,b)=>{
+      let va,vb;
+      if(sortKey==='margen'){ va=margen(a)??-Infinity; vb=margen(b)??-Infinity; }
+      else if(sortKey==='nombre'||sortKey==='formato'){ va=String(a[sortKey]||'').toLowerCase(); vb=String(b[sortKey]||'').toLowerCase(); }
+      else { va=a[sortKey]??-Infinity; vb=b[sortKey]??-Infinity; }
+      if(va<vb)return -sortDir; if(va>vb)return sortDir; return 0;
+    });
+    $('#prodBody').innerHTML=rows.map(p=>{
+      const mg=margen(p);
       return `<tr class="border-b last:border-0 ${p.activo===false?'opacity-40':''}" data-id="${p.id}">
         <td class="py-1 pr-2"><input class="e nombre w-full border-0 focus:bg-yellow-50 rounded px-1" value="${p.nombre}"></td>
         <td class="pr-2"><input class="e codigo w-20 border-0 focus:bg-yellow-50 rounded px-1" value="${p.codigo??''}"></td>
@@ -525,7 +541,9 @@ async function renderProductos(){
       tr.querySelector('.save').onclick=()=>saveRow(tr);
       tr.querySelector('.del').onclick=()=>delRow(tr);
     });
+    $$('.th').forEach(th=>{ const base=th.textContent.replace(/[▲▼]/g,'').trim(); th.textContent=base+arrow(th.dataset.sort); th.classList.toggle('text-emerald-700', th.dataset.sort===sortKey); });
   };
+  $$('.th').forEach(th=>th.onclick=()=>{ const k=th.dataset.sort; if(sortKey===k)sortDir*=-1; else{ sortKey=k; sortDir=(k==='margen'||k==='precio_venta'||k==='precio_compra')?-1:1; } paint($('#qp').value); });
   paint(); $('#qp').oninput=e=>paint(e.target.value);
   $('#addProd').onclick=async()=>{ await store.saveProducto({nombre:'Nuevo producto',codigo:null,formato:'Unidad',precio_venta:0,precio_compra:null,categoria:'Verdura/Fruta',activo:true}); await renderProductos(); };
 
@@ -554,24 +572,24 @@ async function renderCompras(){
     <div class="bg-white rounded-xl shadow-sm p-4 space-y-3">
       <div class="font-bold">Registrar compra</div>
       <div class="grid grid-cols-2 gap-2 text-sm">
-        <label class="col-span-1">Fecha<input id="cFecha" type="date" value="${todayISO()}" class="w-full border rounded-lg px-2 py-2"></label>
-        <label class="col-span-1">Proveedor<input id="cProv" placeholder="opcional" class="w-full border rounded-lg px-2 py-2"></label>
+        <label>Fecha<input id="cFecha" type="date" value="${todayISO()}" class="w-full border rounded-lg px-2 py-2"></label>
+        <label>Proveedor<input id="cProv" placeholder="opcional" class="w-full border rounded-lg px-2 py-2"></label>
       </div>
       <hr>
       <div class="text-sm font-medium text-slate-500">Ítem</div>
       <label class="text-sm block">Producto
-        <input id="iProd" list="prodList" placeholder="ej: Zanahoria" class="w-full border rounded-lg px-2 py-2">
+        <input id="iProd" list="prodList" placeholder="ej: Platano" class="w-full border rounded-lg px-2 py-2">
         <datalist id="prodList">${PRODS.map(p=>`<option value="${p.nombre}">`).join('')}</datalist>
       </label>
       <div id="memoHint" class="text-xs text-emerald-700"></div>
-      <div class="grid grid-cols-3 gap-2 text-sm">
-        <label>Formato
-          <input id="iFormato" list="fmtList" placeholder="saco…" class="w-full border rounded-lg px-2 py-2">
-          <datalist id="fmtList">${CONVS.map(c=>`<option value="${c.formato}">`).join('')}</datalist>
-        </label>
-        <label>Cantidad<input id="iCant" type="number" step="0.01" value="1" class="w-full border rounded-lg px-2 py-2"></label>
-        <label>kg c/u<input id="iKg" type="number" step="0.01" placeholder="auto" class="w-full border rounded-lg px-2 py-2"></label>
-      </div>
+      <label class="text-sm block">¿Cómo lo compraste?
+        <select id="iModo" class="w-full border rounded-lg px-2 py-2">
+          <option value="formato">Por formato (caja, saco, malla…)</option>
+          <option value="kilos">Por kilos sueltos</option>
+          <option value="unidad">Por unidades</option>
+        </select>
+      </label>
+      <div id="iCampos" class="grid grid-cols-2 gap-2 text-sm"></div>
       <label class="text-sm block">Costo total pagado (CLP)<input id="iCosto" type="number" class="w-full border rounded-lg px-2 py-2"></label>
       <div id="convPrev" class="text-xs bg-emerald-50 text-emerald-800 rounded-lg p-2"></div>
       <label class="text-sm flex items-center gap-2"><input id="iUpd" type="checkbox" checked> Actualizar costo del producto (promedio ponderado últimas 3 compras)</label>
@@ -580,6 +598,15 @@ async function renderCompras(){
         <button id="saveCompra" class="flex-1 py-2 rounded-lg bg-[var(--verde)] text-white text-sm font-bold">Guardar compra</button>
       </div>
       <div id="itemsBuf" class="space-y-1 text-sm"></div>
+      <details class="text-xs text-slate-500 border-t pt-2">
+        <summary class="cursor-pointer select-none">⚙️ Gestionar formatos (ej: caja plátano = 18 kg)</summary>
+        <div id="fmtEditor" class="mt-2 space-y-1"></div>
+        <div class="grid grid-cols-5 gap-1 mt-2 items-center">
+          <input id="fmtNombre" placeholder="caja plátano" class="col-span-2 border rounded px-2 py-1">
+          <input id="fmtKg" type="number" step="0.01" placeholder="kg" class="border rounded px-2 py-1">
+          <button id="fmtAdd" class="col-span-2 bg-slate-200 rounded px-2 py-1">+ Agregar formato</button>
+        </div>
+      </details>
     </div>
     <div class="bg-white rounded-xl shadow-sm p-4">
       <div class="font-bold mb-2">Últimas compras</div>
@@ -588,41 +615,71 @@ async function renderCompras(){
   </div>`;
 
   const buf=[];
-  const kgAuto=()=>{ const f=$('#iFormato').value.trim().toLowerCase(); const c=CONVS.find(x=>x.formato.toLowerCase()===f); return c?c.kg:null; };
-  const preview=()=>{
-    const cant=num($('#iCant').value); const kg=num($('#iKg').value)||kgAuto()||0; const costo=num($('#iCosto').value);
-    const kgEq=cant*kg; const cu=kgEq>0?Math.round(costo/kgEq):0;
-    $('#convPrev').innerHTML = kg? `≈ <b>${kgEq.toLocaleString('es-CL')} kg</b> totales · costo <b>${CLP(cu)}/kg</b>` : 'Escribe un formato conocido o el "kg c/u" manual.';
-    return {kgEq,cu,kg};
-  };
-  ['iFormato','iCant','iKg','iCosto'].forEach(id=>$('#'+id).addEventListener('input',preview)); preview();
+  const fmtKgOf=name=>{ const c=CONVS.find(x=>x.formato.toLowerCase()===(name||'').trim().toLowerCase()); return c?c.kg:null; };
 
-  // Memoria: al elegir un producto, precarga su última compra (todo editable)
+  function pintarCampos(){
+    const modo=$('#iModo').value;
+    if(modo==='formato'){
+      $('#iCampos').innerHTML=`
+        <label class="col-span-1">Formato
+          <select id="iFormato" class="w-full border rounded-lg px-2 py-2">${CONVS.map(c=>`<option value="${c.formato}">${c.formato} (${c.kg}kg)</option>`).join('')}</select>
+        </label>
+        <label class="col-span-1">N° de bultos<input id="iCant" type="number" step="0.01" value="1" class="w-full border rounded-lg px-2 py-2"></label>`;
+    } else if(modo==='kilos'){
+      $('#iCampos').innerHTML=`<label class="col-span-2">Kilos comprados (sueltos)<input id="iKgDir" type="number" step="0.01" placeholder="ej: 5" class="w-full border rounded-lg px-2 py-2"></label>`;
+    } else {
+      $('#iCampos').innerHTML=`<label class="col-span-2">Unidades compradas<input id="iUnid" type="number" step="1" placeholder="ej: 12" class="w-full border rounded-lg px-2 py-2"></label>`;
+    }
+    $$('#iCampos input, #iCampos select').forEach(el=>el.addEventListener('input',preview));
+    preview();
+  }
+
+  function calc(){
+    const modo=$('#iModo').value; const costo=num($('#iCosto').value);
+    if(modo==='formato'){ const fmt=$('#iFormato')?.value||''; const kgf=fmtKgOf(fmt)||0; const cant=num($('#iCant')?.value); const kgEq=cant*kgf;
+      return {modo,formato_compra:fmt,cantidad_bruta:cant,kg_por_formato:kgf,kg_equivalente:kgEq,unidad:'kg',cu:kgEq>0?Math.round(costo/kgEq):0}; }
+    if(modo==='kilos'){ const kg=num($('#iKgDir')?.value);
+      return {modo,formato_compra:'kilos sueltos',cantidad_bruta:kg,kg_por_formato:1,kg_equivalente:kg,unidad:'kg',cu:kg>0?Math.round(costo/kg):0}; }
+    const un=num($('#iUnid')?.value);
+    return {modo,formato_compra:'unidad',cantidad_bruta:un,kg_por_formato:1,kg_equivalente:un,unidad:'un',cu:un>0?Math.round(costo/un):0};
+  }
+  function preview(){
+    const c=calc();
+    if(c.unidad==='kg') $('#convPrev').innerHTML = c.kg_equivalente>0?`≈ <b>${c.kg_equivalente.toLocaleString('es-CL')} kg</b> · costo <b>${CLP(c.cu)}/kg</b>`:'Completa cantidad y costo.';
+    else $('#convPrev').innerHTML = c.kg_equivalente>0?`<b>${c.kg_equivalente} unidades</b> · costo <b>${CLP(c.cu)}/unidad</b>`:'Completa cantidad y costo.';
+    return c;
+  }
+  $('#iModo').onchange=pintarCampos;
+  $('#iCosto').addEventListener('input',preview);
+  pintarCampos();
+
   async function precargarUltima(){
-    const nombre=$('#iProd').value.trim(); if(!nombre) return;
+    const nombre=$('#iProd').value.trim(); if(!nombre){$('#memoHint').textContent='';return;}
     const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase()); if(!p) return;
-    const u=await store.ultimaCompraDe(p.id);
-    if(!u){ $('#memoHint').textContent=''; return; }
-    if(u.formato_compra) $('#iFormato').value=u.formato_compra;
-    if(u.kg_por_formato) $('#iKg').value=u.kg_por_formato;
-    if(u.cantidad_bruta) $('#iCant').value=u.cantidad_bruta;
-    if(u.costo_total)    $('#iCosto').value=u.costo_total;
-    $('#memoHint').textContent=`↩︎ Precargado de la última compra (${u.fecha||'—'}): ${u.cantidad_bruta||''} ${u.formato_compra||''} · ${CLP(u.costo_total)}. Ajusta lo que haya cambiado.`;
+    const u=await store.ultimaCompraDe(p.id); if(!u){$('#memoHint').textContent='';return;}
+    if(u.formato_compra==='kilos sueltos'){ $('#iModo').value='kilos'; pintarCampos(); if($('#iKgDir'))$('#iKgDir').value=u.cantidad_bruta; }
+    else if(u.formato_compra==='unidad'){ $('#iModo').value='unidad'; pintarCampos(); if($('#iUnid'))$('#iUnid').value=u.cantidad_bruta; }
+    else { $('#iModo').value='formato'; pintarCampos();
+      if($('#iFormato')&&u.formato_compra){ if(![...$('#iFormato').options].some(o=>o.value===u.formato_compra)){ const o=document.createElement('option'); o.value=u.formato_compra; o.textContent=u.formato_compra; $('#iFormato').appendChild(o); } $('#iFormato').value=u.formato_compra; }
+      if($('#iCant'))$('#iCant').value=u.cantidad_bruta; }
+    if(u.costo_total) $('#iCosto').value=u.costo_total;
+    $('#memoHint').textContent=`↩︎ Última compra (${u.fecha||'—'}): ${u.cantidad_bruta||''} ${u.formato_compra||''} · ${CLP(u.costo_total)}. Ajusta lo que cambió.`;
     preview();
   }
   $('#iProd').addEventListener('change',precargarUltima);
 
   $('#addItem').onclick=()=>{
     const nombre=$('#iProd').value.trim(); if(!nombre){toast('Falta producto',false);return;}
-    const {kgEq,cu,kg}=preview(); const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase());
-    buf.push({producto_id:p?.id||null, nombre, formato_compra:$('#iFormato').value.trim()||null,
-      cantidad_bruta:num($('#iCant').value), kg_por_formato:kg||null, kg_equivalente:kgEq,
-      costo_total:Math.round(num($('#iCosto').value)), costo_unitario_kg:cu, _upd:$('#iUpd').checked});
-    paintBuf(); $('#iProd').value='';$('#iFormato').value='';$('#iCant').value='1';$('#iKg').value='';$('#iCosto').value=''; preview();
+    const c=preview(); if(c.kg_equivalente<=0){toast('Completa cantidad y costo',false);return;}
+    const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase());
+    buf.push({producto_id:p?.id||null, nombre, formato_compra:c.formato_compra, cantidad_bruta:c.cantidad_bruta,
+      kg_por_formato:c.kg_por_formato, kg_equivalente:c.kg_equivalente, costo_total:Math.round(num($('#iCosto').value)),
+      costo_unitario_kg:c.cu, _unidad:c.unidad, _upd:$('#iUpd').checked});
+    paintBuf(); $('#iProd').value=''; $('#iCosto').value=''; $('#memoHint').textContent=''; pintarCampos();
   };
   function paintBuf(){ $('#itemsBuf').innerHTML=buf.map((b,i)=>`<div class="flex justify-between bg-slate-50 rounded px-2 py-1">
-    <span>${b.nombre} · ${b.cantidad_bruta}${b.formato_compra?' '+b.formato_compra:''} (${b.kg_equivalente}kg)</span>
-    <span>${CLP(b.costo_total)} · ${CLP(b.costo_unitario_kg)}/kg <button data-d="${i}" class="text-red-400 ml-1">✕</button></span></div>`).join('');
+    <span>${b.nombre} · ${b.cantidad_bruta}${b.formato_compra?' '+b.formato_compra:''} (${b.kg_equivalente}${b._unidad==='un'?'un':'kg'})</span>
+    <span>${CLP(b.costo_total)} · ${CLP(b.costo_unitario_kg)}/${b._unidad==='un'?'un':'kg'} <button data-d="${i}" class="text-red-400 ml-1">✕</button></span></div>`).join('');
     $$('#itemsBuf [data-d]').forEach(x=>x.onclick=()=>{buf.splice(+x.dataset.d,1);paintBuf();}); }
 
   $('#saveCompra').onclick=async()=>{
@@ -630,15 +687,32 @@ async function renderCompras(){
     const total=buf.reduce((s,b)=>s+b.costo_total,0);
     try{
       await store.crearCompra({fecha:$('#cFecha').value,proveedor:$('#cProv').value||null,total},
-        buf.map(({_upd,...rest})=>rest));
+        buf.map(({_upd,_unidad,...rest})=>rest));
       for(const b of buf){ if(b._upd && b.producto_id){ const pond=await store.costoPonderado(b.producto_id); if(pond){ await store.saveProducto({id:b.producto_id,precio_compra:pond}); await store.logPrecio(b.producto_id,'compra',pond); } } }
       toast('Compra guardada '+CLP(total)); buf.length=0; paintBuf(); await refreshProds(); loadHist();
     }catch(e){toast('Error: '+e.message,false);}
   };
 
+  function pintarFmtEditor(){
+    $('#fmtEditor').innerHTML=CONVS.map(c=>`<div class="flex gap-1 items-center" data-fid="${c.id}">
+      <input class="fnom flex-1 border rounded px-2 py-1" value="${c.formato}">
+      <input class="fkg w-16 border rounded px-2 py-1 text-right" type="number" step="0.01" value="${c.kg}">
+      <span class="text-slate-400">kg</span>
+      <button class="fsave text-emerald-600 px-1">💾</button>
+      <button class="fdel text-red-400 px-1">🗑️</button></div>`).join('')||'<div class="text-slate-400">Sin formatos aún</div>';
+    $$('#fmtEditor [data-fid]').forEach(row=>{
+      const id=row.dataset.fid;
+      row.querySelector('.fsave').onclick=async()=>{ await store.saveConversion({id,formato:row.querySelector('.fnom').value.trim(),kg:num(row.querySelector('.fkg').value)}); await refreshConvs(); toast('Formato guardado'); pintarFmtEditor(); if($('#iModo').value==='formato')pintarCampos(); };
+      row.querySelector('.fdel').onclick=async()=>{ if(!confirm('¿Eliminar formato?'))return; await store.borrarConversion(id); await refreshConvs(); toast('Eliminado'); pintarFmtEditor(); if($('#iModo').value==='formato')pintarCampos(); };
+    });
+  }
+  $('#fmtAdd').onclick=async()=>{ const n=$('#fmtNombre').value.trim(); const k=num($('#fmtKg').value); if(!n||!k){toast('Escribe nombre y kg del formato',false);return;} await store.saveConversion({formato:n,kg:k}); await refreshConvs(); $('#fmtNombre').value='';$('#fmtKg').value=''; toast('Formato agregado'); pintarFmtEditor(); if($('#iModo').value==='formato')pintarCampos(); };
+  pintarFmtEditor();
+
   async function loadHist(){ const h=await store.comprasRecientes(40);
-    $('#compHist').innerHTML=h.map(c=>`<div class="border-b last:border-0 py-1"><div class="flex justify-between"><span class="font-medium">${c.nombre}</span><span>${CLP(c.costo_total)}</span></div>
-      <div class="text-xs text-slate-400">${c.fecha||''} · ${c.kg_equivalente}kg · ${CLP(c.costo_unitario_kg)}/kg${c.proveedor?' · '+c.proveedor:''}</div></div>`).join('')||'<div class="text-slate-400">Sin compras</div>'; }
+    $('#compHist').innerHTML=h.map(c=>{ const u=c.formato_compra==='unidad'?'un':'kg';
+      return `<div class="border-b last:border-0 py-1"><div class="flex justify-between"><span class="font-medium">${c.nombre}</span><span>${CLP(c.costo_total)}</span></div>
+      <div class="text-xs text-slate-400">${c.fecha||''} · ${c.kg_equivalente}${u} · ${CLP(c.costo_unitario_kg)}/${u}${c.proveedor?' · '+c.proveedor:''}</div></div>`; }).join('')||'<div class="text-slate-400">Sin compras</div>'; }
   loadHist();
 }
 
