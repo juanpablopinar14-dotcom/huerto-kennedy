@@ -403,7 +403,7 @@ ${catalogo}`;
 }
 async function analizarImagenGemini(b64){
   const key=getAIKey(); if(!key) throw new Error('Falta la API key');
-  const url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='+encodeURIComponent(key);
+  const url='https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key='+encodeURIComponent(key);
   const resp=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},
     body:JSON.stringify({contents:[{parts:[{inline_data:{mime_type:'image/jpeg',data:b64}},{text:promptTicket()}]}]})});
   if(!resp.ok){ const t=await resp.text(); throw new Error('API '+resp.status+' · '+t.slice(0,160)); }
