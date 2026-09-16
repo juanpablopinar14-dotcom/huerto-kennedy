@@ -382,9 +382,9 @@ function matchCode(code){
 const _paintSubmode=paintSubmode;
 paintSubmode=function(){ if(scanner){scanner.stop().catch(()=>{});scanner=null;} _paintSubmode(); };
 
-/* ----- Foto / lectura de ticket con IA ----- */
-const AI_MODEL='claude-sonnet-4-6';
+/* ----- Foto / lectura de ticket con IA (Gemini gratis o Anthropic) ----- */
 const getAIKey=()=>localStorage.getItem('hk_ai_key')||'';
+const getAIProv=()=>localStorage.getItem('hk_ai_prov')||'gemini';
 function promptTicket(){
   const catalogo=PRODS.map(p=>`${p.id} | cod:${p.codigo??'-'} | ${p.nombre} | ${p.formato}`).join('\n');
   return `Eres el sistema de caja de una verdulería en Chile. Te paso la foto de un ticket o listado de una balanza (columnas: CODIGO, PLU, DENOMINACION y debajo OPERACIONES, PESO, IMPORTE) y el catálogo de productos.
@@ -401,22 +401,33 @@ Reglas:
 CATÁLOGO (id | codigo | nombre | formato):
 ${catalogo}`;
 }
-async function analizarImagenDirecto(b64){
+async function analizarImagenGemini(b64){
+  const key=getAIKey(); if(!key) throw new Error('Falta la API key');
+  const url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+encodeURIComponent(key);
+  const resp=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({contents:[{parts:[{inline_data:{mime_type:'image/jpeg',data:b64}},{text:promptTicket()}]}]})});
+  if(!resp.ok){ const t=await resp.text(); throw new Error('API '+resp.status+' · '+t.slice(0,160)); }
+  const data=await resp.json();
+  const text=(data.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
+  return JSON.parse(text.replace(/```json|```/g,'').trim());
+}
+async function analizarImagenAnthropic(b64){
   const key=getAIKey(); if(!key) throw new Error('Falta la API key');
   const resp=await fetch('https://api.anthropic.com/v1/messages',{
     method:'POST',
     headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-    body:JSON.stringify({model:AI_MODEL,max_tokens:2000,messages:[{role:'user',content:[
+    body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:2000,messages:[{role:'user',content:[
       {type:'image',source:{type:'base64',media_type:'image/jpeg',data:b64}},
       {type:'text',text:promptTicket()}]}]})
   });
-  if(!resp.ok){ const t=await resp.text(); throw new Error('API '+resp.status+' · '+t.slice(0,140)); }
+  if(!resp.ok){ const t=await resp.text(); throw new Error('API '+resp.status+' · '+t.slice(0,160)); }
   const data=await resp.json();
   const text=(data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
   return JSON.parse(text.replace(/```json|```/g,'').trim());
 }
 function paintFoto(v){
-  const key=getAIKey(); const listo = store.mode==='supabase' || !!key;
+  const key=getAIKey(); const prov=getAIProv();
+  const listo = store.mode==='supabase' || !!key;
   v.innerHTML=`<div class="bg-white rounded-xl shadow-sm p-4">
     <p class="text-sm mb-3">Saca o sube una foto del ticket/listado. La IA lo lee y llena el carrito para que revises antes de cobrar.</p>
     <input id="foto" type="file" accept="image/*" capture="environment" class="block w-full text-sm mb-3">
@@ -424,16 +435,27 @@ function paintFoto(v){
     ${listo?'':'<p class="text-xs text-amber-600 mt-3">⚠️ Configura la IA abajo para poder leer fotos en modo local.</p>'}
     <div id="fotoStatus" class="text-sm text-slate-500 mt-3"></div>
     <details class="mt-4 text-xs text-slate-500" ${listo?'':'open'}><summary class="cursor-pointer select-none">⚙️ Configurar IA (modo local)</summary>
-      <p class="mt-2">Pega tu API key de Anthropic (la sacas de <b>console.anthropic.com</b>). Se guarda solo en <b>este navegador</b> — no viaja a internet ni queda en el código, así que puedes subir la app a GitHub sin filtrarla.</p>
-      <div class="flex gap-2 mt-2">
-        <input id="aiKey" type="password" placeholder="sk-ant-..." value="${key}" class="flex-1 border rounded-lg px-2 py-1">
-        <button id="aiSave" class="px-3 py-1 rounded-lg bg-slate-200">Guardar</button>
-        ${key?'<button id="aiClear" class="px-3 py-1 rounded-lg bg-red-100 text-red-600">Borrar</button>':''}
+      <div class="mt-2 space-y-2">
+        <div>
+          <div class="font-medium mb-1">Proveedor</div>
+          <label class="mr-3"><input type="radio" name="aiProv" value="gemini" ${prov==='gemini'?'checked':''}> Google Gemini <span class="text-emerald-600">(gratis)</span></label>
+          <label><input type="radio" name="aiProv" value="anthropic" ${prov==='anthropic'?'checked':''}> Anthropic <span class="text-slate-400">(de pago)</span></label>
+        </div>
+        <p id="aiHelp" class="text-slate-500"></p>
+        <div class="flex gap-2">
+          <input id="aiKey" type="password" placeholder="pega tu API key" value="${key}" class="flex-1 border rounded-lg px-2 py-1">
+          <button id="aiSave" class="px-3 py-1 rounded-lg bg-slate-200">Guardar</button>
+          ${key?'<button id="aiClear" class="px-3 py-1 rounded-lg bg-red-100 text-red-600">Borrar</button>':''}
+        </div>
+        <p class="text-slate-400">La key se guarda solo en <b>este navegador</b>, no en el código ni en internet. Puedes subir la app a GitHub sin filtrarla.</p>
       </div>
-      <p class="mt-2 text-amber-600">Para producción lo ideal es la Edge Function de Supabase (la key queda en el servidor). Esta vía directa es para probar rápido.</p>
     </details>
   </div>`;
-  $('#aiSave').onclick=()=>{ const k=$('#aiKey').value.trim(); if(!k){toast('Pega una key',false);return;} localStorage.setItem('hk_ai_key',k); toast('Key guardada'); paintSubmode(); };
+  const help={gemini:'Gratis: entra a <b>aistudio.google.com</b> → “Get API key” → créala (no pide tarjeta) y pégala aquí.', anthropic:'De pago: <b>console.anthropic.com</b> → API Keys → Create Key (empieza con sk-ant-, requiere saldo).'};
+  const setHelp=()=>{ const p=$('input[name=aiProv]:checked')?.value||prov; $('#aiHelp').innerHTML=help[p]; };
+  setHelp();
+  $$('input[name=aiProv]').forEach(r=>r.onchange=()=>{ localStorage.setItem('hk_ai_prov',$('input[name=aiProv]:checked').value); setHelp(); });
+  $('#aiSave').onclick=()=>{ const k=$('#aiKey').value.trim(); if(!k){toast('Pega una key',false);return;} localStorage.setItem('hk_ai_key',k); localStorage.setItem('hk_ai_prov',$('input[name=aiProv]:checked').value); toast('Guardado'); paintSubmode(); };
   const clr=$('#aiClear'); if(clr) clr.onclick=()=>{ localStorage.removeItem('hk_ai_key'); toast('Key borrada'); paintSubmode(); };
   if(!listo) return;
   $('#btnFoto').onclick=async()=>{
@@ -445,7 +467,9 @@ function paintFoto(v){
       if(store.mode==='supabase'){
         const {data,error}=await sb.functions.invoke('analizar-venta',{body:{image:b64, productos:PRODS.map(p=>({id:p.id,codigo:p.codigo,nombre:p.nombre,formato:p.formato,precio:p.precio_venta}))}});
         if(error)throw error; parsed=data;
-      } else { parsed=await analizarImagenDirecto(b64); }
+      } else {
+        parsed = getAIProv()==='anthropic' ? await analizarImagenAnthropic(b64) : await analizarImagenGemini(b64);
+      }
       const items=parsed.items||[];
       if(!items.length){$('#fotoStatus').textContent='No se detectaron productos. Prueba con más luz o más cerca.';return;}
       let cargados=0; const sinMatch=[];
