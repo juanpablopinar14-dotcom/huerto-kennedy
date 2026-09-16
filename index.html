@@ -40,8 +40,10 @@
   <nav class="max-w-5xl mx-auto px-2 pb-2 flex gap-1 overflow-x-auto text-sm">
     <button data-tab="vender"    class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">🛒 Vender</button>
     <button data-tab="productos" class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">📦 Productos</button>
+    <button data-tab="lista"     class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">🧾 Lista</button>
     <button data-tab="compras"   class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">🚚 Compras</button>
     <button data-tab="merma"     class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">🗑️ Merma</button>
+    <button data-tab="caja"      class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">💰 Caja</button>
     <button data-tab="dashboard" class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">📊 Dashboard</button>
   </nav>
 </header>
@@ -62,6 +64,7 @@ const CLP = n => '$'+(Math.round(n||0)).toLocaleString('es-CL');
 const num = v => { const n=parseFloat(String(v??'').replace(',','.')); return isNaN(n)?0:n; };
 const todayISO = ()=> new Date().toISOString().slice(0,10);
 const uid = ()=> (crypto.randomUUID?crypto.randomUUID():'id'+Date.now()+Math.random());
+const VENTANA_COMPRAS = 3; // costo de compra = promedio ponderado por kg de las últimas N compras del producto
 
 function toast(msg,ok=true){
   const t=$('#toast'); t.textContent=msg;
@@ -158,6 +161,75 @@ const store = {
     if(useSB){ const row={...c}; if(!row.id)delete row.id; const {data,error}=await sb.from('conversiones').upsert(row).select().single(); if(error)throw error; return data; }
     let arr=await this.conversiones(); if(!c.id){c.id=uid();arr.push(c);}else arr=arr.map(x=>x.id===c.id?{...x,...c}:x); LS.set('conversiones',arr); return c;
   },
+
+  // ---- MEMORIA / COSTO PONDERADO ----
+  async comprasItemsDeProducto(producto_id, n=20){
+    if(!producto_id) return [];
+    if(useSB){
+      const {data,error}=await sb.from('compra_items').select('*, compras!inner(fecha)').eq('producto_id',producto_id).order('id',{ascending:false}).limit(n);
+      if(error)throw error; return data.map(r=>({...r,fecha:r.compras.fecha}));
+    }
+    const compras=LS.get('compras',[]); const map=Object.fromEntries(compras.map(c=>[c.id,c.fecha]));
+    return LS.get('compra_items',[]).filter(it=>it.producto_id===producto_id).map(it=>({...it,fecha:map[it.compra_id]})).reverse().slice(0,n);
+  },
+  async ultimaCompraDe(producto_id){ const a=await this.comprasItemsDeProducto(producto_id,1); return a[0]||null; },
+  async costoPonderado(producto_id, ventana=VENTANA_COMPRAS){
+    const items=(await this.comprasItemsDeProducto(producto_id,ventana)).filter(x=>num(x.kg_equivalente)>0 && num(x.costo_total)>0);
+    if(!items.length) return null;
+    const kg=items.reduce((s,x)=>s+num(x.kg_equivalente),0);
+    const costo=items.reduce((s,x)=>s+num(x.costo_total),0);
+    return kg>0?Math.round(costo/kg):null;
+  },
+
+  // ---- VENTAS EN EFECTIVO (para cuadre de caja) ----
+  async ventasEfectivoDia(fecha){
+    if(useSB){ const {data,error}=await sb.from('ventas').select('total').eq('fecha',fecha).eq('medio_pago','efectivo'); if(error)throw error; return data.reduce((s,v)=>s+(v.total||0),0); }
+    return LS.get('ventas',[]).filter(v=>v.fecha===fecha && v.medio_pago==='efectivo').reduce((s,v)=>s+(v.total||0),0);
+  },
+
+  // ---- LISTAS DE COMPRA ----
+  async listas(){
+    if(useSB){ const {data,error}=await sb.from('listas_compra').select('*').order('created_at',{ascending:false}); if(error)throw error; return data; }
+    return LS.get('listas',[]).sort((a,b)=>(b.created_at||'').localeCompare(a.created_at||''));
+  },
+  async listaItems(lista_id){
+    if(useSB){ const {data,error}=await sb.from('lista_items').select('*').eq('lista_id',lista_id).order('id'); if(error)throw error; return data; }
+    return LS.get('lista_items',[]).filter(x=>x.lista_id===lista_id);
+  },
+  async guardarLista(header, items){
+    if(useSB){
+      const row={...header}; if(!row.id)delete row.id;
+      const {data:l,error:e1}=await sb.from('listas_compra').upsert(row).select().single(); if(e1)throw e1;
+      await sb.from('lista_items').delete().eq('lista_id',l.id);
+      if(items.length){ const rows=items.map(({id,...it})=>({producto_id:it.producto_id||null,nombre:it.nombre,formato_compra:it.formato_compra||null,kg_por_formato:it.kg_por_formato||null,cantidad_bruta:it.cantidad_bruta||0,costo_total:it.costo_total??null,lista_id:l.id})); const {error:e2}=await sb.from('lista_items').insert(rows); if(e2)throw e2; }
+      return l;
+    }
+    let listas=LS.get('listas',[]); let l = header.id ? listas.find(x=>x.id===header.id) : null;
+    if(l){ Object.assign(l,header); } else { l={id:uid(),created_at:new Date().toISOString(),...header}; listas.push(l); }
+    LS.set('listas',listas);
+    let li=LS.get('lista_items',[]).filter(x=>x.lista_id!==l.id);
+    items.forEach(it=>li.push({id:uid(),lista_id:l.id,producto_id:it.producto_id||null,nombre:it.nombre,formato_compra:it.formato_compra||null,kg_por_formato:it.kg_por_formato||null,cantidad_bruta:it.cantidad_bruta||0,costo_total:it.costo_total??null}));
+    LS.set('lista_items',li); return l;
+  },
+  async cerrarLista(id){
+    if(useSB){ const {error}=await sb.from('listas_compra').update({estado:'cerrada'}).eq('id',id); if(error)throw error; return; }
+    LS.set('listas',LS.get('listas',[]).map(x=>x.id===id?{...x,estado:'cerrada'}:x));
+  },
+  async borrarLista(id){
+    if(useSB){ await sb.from('lista_items').delete().eq('lista_id',id); const {error}=await sb.from('listas_compra').delete().eq('id',id); if(error)throw error; return; }
+    LS.set('listas',LS.get('listas',[]).filter(x=>x.id!==id));
+    LS.set('lista_items',LS.get('lista_items',[]).filter(x=>x.lista_id!==id));
+  },
+
+  // ---- CIERRES DE CAJA ----
+  async cierres(n=30){
+    if(useSB){ const {data,error}=await sb.from('cierres_caja').select('*').order('fecha',{ascending:false}).limit(n); if(error)throw error; return data; }
+    return LS.get('cierres',[]).sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||'')).slice(0,n);
+  },
+  async guardarCierre(c){
+    if(useSB){ const row={...c}; if(!row.id)delete row.id; const {data,error}=await sb.from('cierres_caja').upsert(row).select().single(); if(error)throw error; return data; }
+    let arr=LS.get('cierres',[]); if(c.id){ arr=arr.map(x=>x.id===c.id?{...x,...c}:x); } else { c={id:uid(),created_at:new Date().toISOString(),...c}; arr.push(c);} LS.set('cierres',arr); return c;
+  },
 };
 
 /* ---------- SEED para MODO LOCAL (en Supabase los datos vienen de la BBDD) ---------- */
@@ -176,7 +248,7 @@ $('#modeBadge').textContent = store.mode==='supabase' ? '● conectado a base de
 async function refreshProds(){ PRODS = await store.productos(); }
 async function refreshConvs(){ CONVS = await store.conversiones(); }
 
-const tabs={ vender:renderVender, productos:renderProductos, compras:renderCompras, merma:renderMerma, dashboard:renderDashboard };
+const tabs={ vender:renderVender, productos:renderProductos, lista:renderLista, compras:renderCompras, merma:renderMerma, caja:renderCaja, dashboard:renderDashboard };
 async function go(tab){
   $$('.tab').forEach(b=>b.classList.toggle('tab-active',b.dataset.tab===tab));
   $$('.tab').forEach(b=>{ if(b.dataset.tab!==tab) b.classList.add('bg-white'); else b.classList.remove('bg-white'); });
@@ -415,6 +487,7 @@ async function renderCompras(){
         <input id="iProd" list="prodList" placeholder="ej: Zanahoria" class="w-full border rounded-lg px-2 py-2">
         <datalist id="prodList">${PRODS.map(p=>`<option value="${p.nombre}">`).join('')}</datalist>
       </label>
+      <div id="memoHint" class="text-xs text-emerald-700"></div>
       <div class="grid grid-cols-3 gap-2 text-sm">
         <label>Formato
           <input id="iFormato" list="fmtList" placeholder="saco…" class="w-full border rounded-lg px-2 py-2">
@@ -425,7 +498,7 @@ async function renderCompras(){
       </div>
       <label class="text-sm block">Costo total pagado (CLP)<input id="iCosto" type="number" class="w-full border rounded-lg px-2 py-2"></label>
       <div id="convPrev" class="text-xs bg-emerald-50 text-emerald-800 rounded-lg p-2"></div>
-      <label class="text-sm flex items-center gap-2"><input id="iUpd" type="checkbox" checked> Actualizar precio de compra del producto</label>
+      <label class="text-sm flex items-center gap-2"><input id="iUpd" type="checkbox" checked> Actualizar costo del producto (promedio ponderado últimas 3 compras)</label>
       <div class="flex gap-2">
         <button id="addItem" class="flex-1 py-2 rounded-lg bg-slate-100 text-sm font-medium">+ Agregar ítem</button>
         <button id="saveCompra" class="flex-1 py-2 rounded-lg bg-[var(--verde)] text-white text-sm font-bold">Guardar compra</button>
@@ -448,6 +521,21 @@ async function renderCompras(){
   };
   ['iFormato','iCant','iKg','iCosto'].forEach(id=>$('#'+id).addEventListener('input',preview)); preview();
 
+  // Memoria: al elegir un producto, precarga su última compra (todo editable)
+  async function precargarUltima(){
+    const nombre=$('#iProd').value.trim(); if(!nombre) return;
+    const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase()); if(!p) return;
+    const u=await store.ultimaCompraDe(p.id);
+    if(!u){ $('#memoHint').textContent=''; return; }
+    if(u.formato_compra) $('#iFormato').value=u.formato_compra;
+    if(u.kg_por_formato) $('#iKg').value=u.kg_por_formato;
+    if(u.cantidad_bruta) $('#iCant').value=u.cantidad_bruta;
+    if(u.costo_total)    $('#iCosto').value=u.costo_total;
+    $('#memoHint').textContent=`↩︎ Precargado de la última compra (${u.fecha||'—'}): ${u.cantidad_bruta||''} ${u.formato_compra||''} · ${CLP(u.costo_total)}. Ajusta lo que haya cambiado.`;
+    preview();
+  }
+  $('#iProd').addEventListener('change',precargarUltima);
+
   $('#addItem').onclick=()=>{
     const nombre=$('#iProd').value.trim(); if(!nombre){toast('Falta producto',false);return;}
     const {kgEq,cu,kg}=preview(); const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase());
@@ -467,7 +555,7 @@ async function renderCompras(){
     try{
       await store.crearCompra({fecha:$('#cFecha').value,proveedor:$('#cProv').value||null,total},
         buf.map(({_upd,...rest})=>rest));
-      for(const b of buf){ if(b._upd && b.producto_id && b.costo_unitario_kg){ await store.saveProducto({id:b.producto_id,precio_compra:b.costo_unitario_kg}); await store.logPrecio(b.producto_id,'compra',b.costo_unitario_kg); } }
+      for(const b of buf){ if(b._upd && b.producto_id){ const pond=await store.costoPonderado(b.producto_id); if(pond){ await store.saveProducto({id:b.producto_id,precio_compra:pond}); await store.logPrecio(b.producto_id,'compra',pond); } } }
       toast('Compra guardada '+CLP(total)); buf.length=0; paintBuf(); await refreshProds(); loadHist();
     }catch(e){toast('Error: '+e.message,false);}
   };
@@ -577,6 +665,194 @@ async function renderDashboard(){
 }
 
 /* ---------- init ---------- */
+/* ============================================================
+   LISTA DE COMPRAS  (borrador -> cerrar como compra)
+   ============================================================ */
+let listaActual=null; // {header:{...}, items:[...]}
+async function renderLista(){
+  await refreshProds(); await refreshConvs();
+  main.innerHTML=`
+  <div class="bg-emerald-50 text-emerald-900 text-sm rounded-xl p-3 mb-3">
+    <b>¿Cómo funciona?</b> &nbsp;1) Arma la lista con lo que vas a comprar y cuánto. &nbsp;2) En el mercado, escribe el precio que pagaste y ajusta cantidades. &nbsp;3) Cuando esté todo listo, aprieta <b>✅ Cerrar como compra</b> y queda registrado en Compras.
+  </div>
+  <div class="grid lg:grid-cols-3 gap-3">
+    <div class="lg:col-span-2 bg-white rounded-xl shadow-sm p-4 space-y-3">
+      <div class="flex items-center gap-2">
+        <input id="lNombre" placeholder="Nombre de la lista (ej: Compra del martes)" class="border rounded-lg px-2 py-2 text-sm flex-1">
+        <button id="lNueva" class="px-3 py-2 rounded-lg bg-slate-100 text-sm font-medium whitespace-nowrap">🗒️ Nueva</button>
+      </div>
+      <div class="overflow-x-auto">
+      <table class="w-full text-sm"><thead class="text-left text-slate-400 border-b">
+        <tr><th class="py-2 pr-2">Producto</th><th class="pr-2">Cantidad</th><th class="pr-2">Formato</th><th class="pr-2 text-right">Precio pagado $</th><th></th></tr>
+      </thead><tbody id="lBody"></tbody></table></div>
+      <div class="grid grid-cols-4 gap-2 text-sm items-end border-t pt-3">
+        <label class="col-span-2">Agregar producto<input id="lProd" list="lProdList" placeholder="ej: Tomate" class="w-full border rounded-lg px-2 py-2"><datalist id="lProdList">${PRODS.map(p=>`<option value="${p.nombre}">`).join('')}</datalist></label>
+        <label>Cantidad<input id="lCant" type="number" step="0.01" value="1" class="w-full border rounded-lg px-2 py-2"></label>
+        <label>Formato<input id="lFmt" list="lFmtList" placeholder="caja…" class="w-full border rounded-lg px-2 py-2"><datalist id="lFmtList">${CONVS.map(c=>`<option value="${c.formato}">`).join('')}</datalist></label>
+      </div>
+      <button id="lAdd" class="w-full py-2 rounded-lg bg-slate-100 text-sm font-medium">+ Agregar a la lista</button>
+      <div class="border-t pt-3 flex flex-wrap gap-2 items-center justify-between">
+        <div class="text-sm">Total estimado: <b id="lTotal">$0</b></div>
+        <div class="flex gap-2">
+          <button id="lSave" class="px-3 py-2 rounded-lg bg-slate-200 text-sm font-medium">💾 Guardar borrador</button>
+          <button id="lClose" class="px-3 py-2 rounded-lg bg-[var(--verde)] text-white text-sm font-bold">✅ Cerrar como compra</button>
+        </div>
+      </div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm p-4">
+      <div class="font-bold mb-2">Mis listas</div>
+      <div id="lHist" class="text-sm space-y-1 max-h-[70vh] overflow-y-auto"></div>
+    </div>
+  </div>`;
+
+  const kgAuto=f=>{ const c=CONVS.find(x=>x.formato.toLowerCase()===(f||'').toLowerCase()); return c?c.kg:null; };
+  if(!listaActual) nuevaLista();
+  pintarLista(); cargarHist();
+
+  function nuevaLista(){ listaActual={header:{estado:'borrador', fecha:todayISO(), nombre:''}, items:[]}; }
+  function totalEst(){ const t=listaActual.items.reduce((s,it)=>s+(it.costo_total||0),0); $('#lTotal').textContent=CLP(t); }
+  function pintarLista(){
+    $('#lNombre').value=listaActual.header.nombre||'';
+    $('#lBody').innerHTML=listaActual.items.map((it,i)=>`<tr class="border-b last:border-0">
+      <td class="py-1 pr-2">${it.nombre}</td>
+      <td class="pr-2"><input data-i="${i}" class="lc cant w-16 border rounded px-1 py-1" value="${it.cantidad_bruta}"></td>
+      <td class="pr-2 text-slate-500">${it.formato_compra||'—'}</td>
+      <td class="pr-2 text-right"><input data-i="${i}" class="lc costo w-24 text-right border rounded px-1 py-1" placeholder="—" value="${it.costo_total??''}"></td>
+      <td class="text-right"><button data-del="${i}" class="text-red-400 px-1">✕</button></td></tr>`).join('')
+      || '<tr><td colspan="5" class="text-center text-slate-400 py-4">Lista vacía. Agrega productos abajo 👇</td></tr>';
+    $$('#lBody .lc.cant').forEach(el=>el.onchange=()=>{ listaActual.items[+el.dataset.i].cantidad_bruta=num(el.value); totalEst(); });
+    $$('#lBody .lc.costo').forEach(el=>el.onchange=()=>{ listaActual.items[+el.dataset.i].costo_total = el.value===''?null:Math.round(num(el.value)); totalEst(); });
+    $$('#lBody [data-del]').forEach(el=>el.onclick=()=>{ listaActual.items.splice(+el.dataset.del,1); pintarLista(); });
+    totalEst();
+  }
+
+  $('#lNombre').onchange=()=>{ listaActual.header.nombre=$('#lNombre').value.trim(); };
+  $('#lNueva').onclick=()=>{ if(listaActual.items.length && !confirm('¿Empezar una lista nueva? Si no guardaste la actual, la perderás.'))return; nuevaLista(); pintarLista(); };
+  $('#lAdd').onclick=()=>{
+    const nombre=$('#lProd').value.trim(); if(!nombre){toast('Escribe un producto',false);return;}
+    const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase());
+    const fmt=$('#lFmt').value.trim()||null;
+    listaActual.items.push({producto_id:p?.id||null, nombre, formato_compra:fmt, kg_por_formato:kgAuto(fmt), cantidad_bruta:num($('#lCant').value)||1, costo_total:null});
+    $('#lProd').value='';$('#lFmt').value='';$('#lCant').value='1'; pintarLista();
+  };
+  $('#lSave').onclick=async()=>{
+    listaActual.header.nombre=$('#lNombre').value.trim();
+    try{ const l=await store.guardarLista(listaActual.header, listaActual.items); listaActual.header.id=l.id; toast('Borrador guardado'); cargarHist(); }
+    catch(e){toast('Error: '+e.message,false);}
+  };
+  $('#lClose').onclick=async()=>{
+    if(!listaActual.items.length){toast('La lista está vacía',false);return;}
+    const faltan=listaActual.items.filter(it=>it.costo_total==null||it.costo_total<=0);
+    if(faltan.length && !confirm(faltan.length+' producto(s) sin precio. Se ignorarán al registrar la compra. ¿Continuar?'))return;
+    const validos=listaActual.items.filter(it=>it.costo_total>0);
+    if(!validos.length){toast('Ningún producto con precio para registrar',false);return;}
+    const compraItems=validos.map(it=>{ const kg=it.kg_por_formato||kgAuto(it.formato_compra)||0; const kgEq=(it.cantidad_bruta||0)*kg; const cu=kgEq>0?Math.round(it.costo_total/kgEq):null;
+      return {producto_id:it.producto_id, nombre:it.nombre, formato_compra:it.formato_compra, cantidad_bruta:it.cantidad_bruta, kg_por_formato:kg||null, kg_equivalente:kgEq, costo_total:it.costo_total, costo_unitario_kg:cu}; });
+    const total=compraItems.reduce((s,b)=>s+b.costo_total,0);
+    try{
+      listaActual.header.nombre=$('#lNombre').value.trim();
+      const l=await store.guardarLista(listaActual.header, listaActual.items); listaActual.header.id=l.id;
+      await store.crearCompra({fecha:listaActual.header.fecha||todayISO(), proveedor:'Lo Valledor', total}, compraItems);
+      for(const b of compraItems){ if(b.producto_id){ const pond=await store.costoPonderado(b.producto_id); if(pond){ await store.saveProducto({id:b.producto_id,precio_compra:pond}); await store.logPrecio(b.producto_id,'compra',pond); } } }
+      await store.cerrarLista(listaActual.header.id);
+      toast('✅ Compra registrada '+CLP(total)); await refreshProds(); nuevaLista(); pintarLista(); cargarHist();
+    }catch(e){toast('Error: '+e.message,false);}
+  };
+
+  async function cargarHist(){
+    const ls=await store.listas();
+    $('#lHist').innerHTML = ls.map(l=>{
+      const abierta=l.estado!=='cerrada';
+      return `<div class="border-b last:border-0 py-1 flex justify-between items-center">
+        <div><div class="font-medium">${l.nombre||'(sin nombre)'} ${abierta?'<span class="text-amber-600 text-xs">· borrador</span>':'<span class="text-emerald-600 text-xs">· cerrada</span>'}</div>
+          <div class="text-xs text-slate-400">${l.fecha||''}</div></div>
+        <div class="flex gap-1">${abierta?`<button data-open="${l.id}" class="text-emerald-700 text-xs border rounded px-2 py-1">Abrir</button>`:''}
+          <button data-dell="${l.id}" class="text-red-400 text-xs px-1">🗑️</button></div></div>`;
+    }).join('') || '<div class="text-slate-400">Aún no tienes listas. Crea una arriba.</div>';
+    $$('#lHist [data-open]').forEach(b=>b.onclick=async()=>{ const id=b.dataset.open; const ls2=await store.listas(); const h=ls2.find(x=>x.id===id); const items=await store.listaItems(id); listaActual={header:{...h}, items:items.map(it=>({...it}))}; pintarLista(); toast('Lista abierta para editar'); });
+    $$('#lHist [data-dell]').forEach(b=>b.onclick=async()=>{ if(!confirm('¿Eliminar esta lista?'))return; await store.borrarLista(b.dataset.dell); if(listaActual.header.id===b.dataset.dell){nuevaLista();pintarLista();} cargarHist(); });
+  }
+}
+
+/* ============================================================
+   CIERRE DIARIO Y CAJA
+   ============================================================ */
+const BILLETES=[20000,10000,5000,2000,1000];
+const MONEDAS=[500,100,50,10];
+async function renderCaja(){
+  main.innerHTML=`
+  <div class="bg-emerald-50 text-emerald-900 text-sm rounded-xl p-3 mb-3">
+    <b>Cierre de caja del día.</b> Cuenta el efectivo que quedó en la caja al cerrar. La app calcula cuánto se vendió en efectivo, aunque en el día alguien se haya equivocado marcando el medio de pago.
+  </div>
+  <div class="grid lg:grid-cols-3 gap-3">
+    <div class="lg:col-span-2 bg-white rounded-xl shadow-sm p-4 space-y-4">
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <label>Fecha<input id="kFecha" type="date" value="${todayISO()}" class="w-full border rounded-lg px-2 py-2"></label>
+        <label>Fondo inicial (con cuánto abriste la caja)<input id="kFondo" type="number" value="0" class="w-full border rounded-lg px-2 py-2"></label>
+      </div>
+      <div>
+        <div class="font-medium text-sm mb-1">💵 Billetes <span class="text-red-500 text-xs">(obligatorio)</span> — escribe cuántos de cada uno</div>
+        <div id="kBill" class="grid grid-cols-5 gap-2 text-center text-sm"></div>
+      </div>
+      <div>
+        <div class="font-medium text-sm mb-1">🪙 Monedas <span class="text-slate-400 text-xs">(opcional)</span></div>
+        <div id="kMon" class="grid grid-cols-4 gap-2 text-center text-sm"></div>
+      </div>
+      <label class="text-sm block">¿Sacaron plata del efectivo hoy? (retiros)<input id="kRetiro" type="number" value="0" class="w-full border rounded-lg px-2 py-2"><span class="text-xs text-slate-400">Ej: pagar a un proveedor, gastos, sueldo. Déjalo en 0 si no sacaron nada.</span></label>
+      <button id="kSave" class="w-full py-2 rounded-lg bg-[var(--verde)] text-white font-bold">Guardar cierre</button>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm p-4">
+      <div id="kResumen" class="space-y-1 text-sm mb-4"></div>
+      <div class="font-bold mb-2">Cierres anteriores</div>
+      <div id="kHist" class="text-sm space-y-1 max-h-[45vh] overflow-y-auto"></div>
+    </div>
+  </div>`;
+
+  const cell=(den,cls)=>`<div><div class="text-xs text-slate-500 mb-1">${CLP(den)}</div><input data-den="${den}" type="number" min="0" value="0" class="${cls} w-full border rounded-lg px-1 py-2 text-center"></div>`;
+  $('#kBill').innerHTML=BILLETES.map(d=>cell(d,'kb')).join('');
+  $('#kMon').innerHTML=MONEDAS.map(d=>cell(d,'km')).join('');
+
+  const contado=()=>{ let s=0; $$('#kBill .kb, #kMon .km').forEach(el=>s+=(parseInt(el.value)||0)*(+el.dataset.den)); return s; };
+  async function calcular(){
+    const efe=contado(); const fondo=num($('#kFondo').value); const ret=num($('#kRetiro').value);
+    const ventaCalc=efe+ret-fondo;
+    const ventaSist=await store.ventasEfectivoDia($('#kFecha').value);
+    const dif=ventaCalc-ventaSist; const okDif=Math.abs(dif)<=2000;
+    $('#kResumen').innerHTML=`
+      <div class="flex justify-between"><span>Efectivo contado</span><b>${CLP(efe)}</b></div>
+      <div class="flex justify-between text-slate-500"><span>+ Retiros del día</span><span>${CLP(ret)}</span></div>
+      <div class="flex justify-between text-slate-500"><span>− Fondo inicial</span><span>${CLP(fondo)}</span></div>
+      <div class="flex justify-between border-t pt-1 text-base"><span class="font-medium">Venta efectivo (calculada)</span><b class="text-emerald-700">${CLP(ventaCalc)}</b></div>
+      <div class="flex justify-between"><span>Venta efectivo (según ventas cargadas)</span><span>${CLP(ventaSist)}</span></div>
+      <div class="flex justify-between border-t pt-1"><span class="font-medium">Diferencia</span><b class="${okDif?'text-emerald-600':'text-red-600'}">${CLP(dif)}</b></div>
+      <div class="text-xs ${okDif?'text-slate-400':'text-red-500'}">${okDif?'✔ Cuadra bien.':'⚠ Hay descuadre: revisa el conteo, los retiros, o ventas marcadas con otro medio de pago.'}</div>`;
+    return {efe,fondo,ret,ventaCalc,ventaSist,dif};
+  }
+  $$('#kBill .kb, #kMon .km').forEach(el=>el.addEventListener('input',calcular));
+  ['kFondo','kRetiro','kFecha'].forEach(id=>$('#'+id).addEventListener('input',calcular));
+  await calcular();
+
+  $('#kSave').onclick=async()=>{
+    const efe=contado(); if(efe<=0){toast('Cuenta al menos los billetes',false);return;}
+    const r=await calcular(); const detalle={billetes:{},monedas:{}};
+    $$('#kBill .kb').forEach(el=>detalle.billetes[el.dataset.den]=parseInt(el.value)||0);
+    $$('#kMon .km').forEach(el=>detalle.monedas[el.dataset.den]=parseInt(el.value)||0);
+    try{
+      await store.guardarCierre({fecha:$('#kFecha').value, fondo_inicial:r.fondo, retiros:r.ret, efectivo_contado:r.efe,
+        venta_efectivo_calculada:r.ventaCalc, venta_efectivo_sistema:r.ventaSist, diferencia:r.dif, detalle});
+      toast('Cierre guardado'); cargarHist();
+    }catch(e){toast('Error: '+e.message,false);}
+  };
+
+  async function cargarHist(){
+    const cs=await store.cierres(40);
+    $('#kHist').innerHTML=cs.map(c=>`<div class="border-b last:border-0 py-1">
+      <div class="flex justify-between"><span class="font-medium">${c.fecha}</span><span class="text-emerald-700 font-medium">${CLP(c.venta_efectivo_calculada)}</span></div>
+      <div class="text-xs text-slate-400">contado ${CLP(c.efectivo_contado)} · dif ${CLP(c.diferencia)}</div></div>`).join('')||'<div class="text-slate-400">Sin cierres todavía</div>';
+  }
+  cargarHist();
+}
+
 go('vender');
 </script>
 </body>
