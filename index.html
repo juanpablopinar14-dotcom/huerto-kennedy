@@ -382,29 +382,81 @@ function matchCode(code){
 const _paintSubmode=paintSubmode;
 paintSubmode=function(){ if(scanner){scanner.stop().catch(()=>{});scanner=null;} _paintSubmode(); };
 
-/* ----- Foto de lo vendido (requiere Edge Function) ----- */
+/* ----- Foto / lectura de ticket con IA ----- */
+const AI_MODEL='claude-sonnet-4-6';
+const getAIKey=()=>localStorage.getItem('hk_ai_key')||'';
+function promptTicket(){
+  const catalogo=PRODS.map(p=>`${p.id} | cod:${p.codigo??'-'} | ${p.nombre} | ${p.formato}`).join('\n');
+  return `Eres el sistema de caja de una verdulería en Chile. Te paso la foto de un ticket o listado de una balanza (columnas: CODIGO, PLU, DENOMINACION y debajo OPERACIONES, PESO, IMPORTE) y el catálogo de productos.
+Devuelve SOLO un JSON válido, sin texto ni markdown:
+{"items":[{"producto_id":"<id del catálogo o null>","codigo":<numero o null>,"nombre":"<denominación leída>","cantidad":<numero>,"importe":<numero o null>}]}
+Reglas:
+- Cada producto ocupa 2 renglones: arriba "CODIGO PLU DENOMINACION", abajo "OPERACIONES PESO IMPORTE".
+- "codigo" = la columna CODIGO de la izquierda, quitando SOLO los ceros a la izquierda (000004 -> 4, 000137 -> 137, 010001 -> 10001, 010025 -> 10025).
+- Cruza cada línea con el catálogo por ese codigo; si no calza, por el nombre más parecido. Usa el id del catálogo cuando haya match.
+- "cantidad": si el producto es formato Peso, usa el PESO en kg (2,580 -> 2.58). Si es Unidad, usa OPERACIONES.
+- "importe": el monto en pesos de esa línea (4102), o null.
+- Los números traen coma decimal: conviértela a punto. Ignora encabezados, totales y líneas como "CODIGOS: 15".
+
+CATÁLOGO (id | codigo | nombre | formato):
+${catalogo}`;
+}
+async function analizarImagenDirecto(b64){
+  const key=getAIKey(); if(!key) throw new Error('Falta la API key');
+  const resp=await fetch('https://api.anthropic.com/v1/messages',{
+    method:'POST',
+    headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+    body:JSON.stringify({model:AI_MODEL,max_tokens:2000,messages:[{role:'user',content:[
+      {type:'image',source:{type:'base64',media_type:'image/jpeg',data:b64}},
+      {type:'text',text:promptTicket()}]}]})
+  });
+  if(!resp.ok){ const t=await resp.text(); throw new Error('API '+resp.status+' · '+t.slice(0,140)); }
+  const data=await resp.json();
+  const text=(data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
+  return JSON.parse(text.replace(/```json|```/g,'').trim());
+}
 function paintFoto(v){
-  const ready = store.mode==='supabase';
+  const key=getAIKey(); const listo = store.mode==='supabase' || !!key;
   v.innerHTML=`<div class="bg-white rounded-xl shadow-sm p-4">
-    <p class="text-sm mb-3">Saca o sube una foto del ticket / lista de lo vendido. La IA lo lee y llena el carrito para que revises antes de cobrar.</p>
+    <p class="text-sm mb-3">Saca o sube una foto del ticket/listado. La IA lo lee y llena el carrito para que revises antes de cobrar.</p>
     <input id="foto" type="file" accept="image/*" capture="environment" class="block w-full text-sm mb-3">
-    <button id="btnFoto" class="px-4 py-2 rounded-lg bg-[var(--verde)] text-white font-bold text-sm ${ready?'':'opacity-50'}" ${ready?'':'disabled'}>Analizar foto</button>
-    ${ready?'':'<p class="text-xs text-amber-600 mt-3">⚠️ Requiere Supabase + Edge Function <code>analizar-venta</code> configurada (ver README). En modo local no está disponible.</p>'}
+    <button id="btnFoto" class="px-4 py-2 rounded-lg bg-[var(--verde)] text-white font-bold text-sm ${listo?'':'opacity-50'}" ${listo?'':'disabled'}>Analizar foto</button>
+    ${listo?'':'<p class="text-xs text-amber-600 mt-3">⚠️ Configura la IA abajo para poder leer fotos en modo local.</p>'}
     <div id="fotoStatus" class="text-sm text-slate-500 mt-3"></div>
+    <details class="mt-4 text-xs text-slate-500" ${listo?'':'open'}><summary class="cursor-pointer select-none">⚙️ Configurar IA (modo local)</summary>
+      <p class="mt-2">Pega tu API key de Anthropic (la sacas de <b>console.anthropic.com</b>). Se guarda solo en <b>este navegador</b> — no viaja a internet ni queda en el código, así que puedes subir la app a GitHub sin filtrarla.</p>
+      <div class="flex gap-2 mt-2">
+        <input id="aiKey" type="password" placeholder="sk-ant-..." value="${key}" class="flex-1 border rounded-lg px-2 py-1">
+        <button id="aiSave" class="px-3 py-1 rounded-lg bg-slate-200">Guardar</button>
+        ${key?'<button id="aiClear" class="px-3 py-1 rounded-lg bg-red-100 text-red-600">Borrar</button>':''}
+      </div>
+      <p class="mt-2 text-amber-600">Para producción lo ideal es la Edge Function de Supabase (la key queda en el servidor). Esta vía directa es para probar rápido.</p>
+    </details>
   </div>`;
-  if(!ready)return;
+  $('#aiSave').onclick=()=>{ const k=$('#aiKey').value.trim(); if(!k){toast('Pega una key',false);return;} localStorage.setItem('hk_ai_key',k); toast('Key guardada'); paintSubmode(); };
+  const clr=$('#aiClear'); if(clr) clr.onclick=()=>{ localStorage.removeItem('hk_ai_key'); toast('Key borrada'); paintSubmode(); };
+  if(!listo) return;
   $('#btnFoto').onclick=async()=>{
     const f=$('#foto').files[0]; if(!f){toast('Elige una foto',false);return;}
-    $('#fotoStatus').textContent='Leyendo imagen…';
-    const b64=await fileToB64(f);
+    $('#fotoStatus').textContent='Leyendo imagen… (puede tardar unos segundos)';
     try{
-      const {data,error}=await sb.functions.invoke('analizar-venta',{body:{image:b64, productos:PRODS.map(p=>({id:p.id,codigo:p.codigo,nombre:p.nombre,formato:p.formato,precio:p.precio_venta}))}});
-      if(error)throw error;
-      const items=data.items||[];
-      if(!items.length){$('#fotoStatus').textContent='No se detectaron productos.';return;}
-      items.forEach(it=>{ const p=PRODS.find(x=>x.id===it.producto_id)||PRODS.find(x=>String(x.codigo)===String(it.codigo)); if(p) addToCart(p.id,it.cantidad); });
-      ventaSubmode='seleccionar'; paintSubmode();
-      toast(items.length+' productos cargados, revisa el carrito');
+      const b64=await fileToB64(f);
+      let parsed;
+      if(store.mode==='supabase'){
+        const {data,error}=await sb.functions.invoke('analizar-venta',{body:{image:b64, productos:PRODS.map(p=>({id:p.id,codigo:p.codigo,nombre:p.nombre,formato:p.formato,precio:p.precio_venta}))}});
+        if(error)throw error; parsed=data;
+      } else { parsed=await analizarImagenDirecto(b64); }
+      const items=parsed.items||[];
+      if(!items.length){$('#fotoStatus').textContent='No se detectaron productos. Prueba con más luz o más cerca.';return;}
+      let cargados=0; const sinMatch=[];
+      items.forEach(it=>{
+        const cod=it.codigo!=null?String(it.codigo).replace(/^0+/,''):null;
+        const p=PRODS.find(x=>x.id===it.producto_id) || (cod&&PRODS.find(x=>String(x.codigo)===cod)) || PRODS.find(x=>x.nombre.toLowerCase()===String(it.nombre||'').toLowerCase());
+        if(p){ addToCart(p.id, it.cantidad); cargados++; } else sinMatch.push(it.nombre||it.codigo);
+      });
+      ventaSubmode='seleccionar'; paintSubmode(); $('#fotoStatus').textContent='';
+      toast(cargados+' productos cargados'+(sinMatch.length?`, ${sinMatch.length} sin match`:'')+' · revisa el carrito');
+      if(sinMatch.length) console.warn('Sin match:',sinMatch);
     }catch(e){ $('#fotoStatus').textContent='Error: '+e.message; }
   };
 }
