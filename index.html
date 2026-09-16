@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Huerto Kennedy · Inventario</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  :root{--verde:#2e7d32;--verde2:#1b5e20;}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-tap-highlight-color:transparent}
+  .tab-active{background:var(--verde);color:#fff}
+  input,select{outline:none}
+  ::-webkit-scrollbar{height:8px;width:8px}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:8px}
+</style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+
+<!-- ============ CONFIG: pegar credenciales de Supabase aquí ============ -->
+<script>
+  // 1) Reemplaza estos 2 valores con los de tu proyecto Supabase (Settings > API).
+  // 2) Si los dejas como están, la app corre en MODO LOCAL (localStorage), útil para probar.
+  const SUPABASE_URL      = "PEGAR_SUPABASE_URL";      // ej: https://abcd.supabase.co
+  const SUPABASE_ANON_KEY = "PEGAR_SUPABASE_ANON_KEY"; // clave anon (pública)
+</script>
+
+<header class="bg-[var(--verde2)] text-white sticky top-0 z-20 shadow">
+  <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <span class="text-2xl">🥬</span>
+      <div>
+        <div class="font-bold leading-tight">Huerto Kennedy</div>
+        <div id="modeBadge" class="text-[11px] opacity-80">cargando…</div>
+      </div>
+    </div>
+    <div id="clock" class="text-sm opacity-90"></div>
+  </div>
+  <nav class="max-w-5xl mx-auto px-2 pb-2 flex gap-1 overflow-x-auto text-sm">
+    <button data-tab="vender"    class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">🛒 Vender</button>
+    <button data-tab="productos" class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">📦 Productos</button>
+    <button data-tab="compras"   class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">🚚 Compras</button>
+    <button data-tab="merma"     class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">🗑️ Merma</button>
+    <button data-tab="dashboard" class="tab px-4 py-2 rounded-lg font-medium whitespace-nowrap">📊 Dashboard</button>
+  </nav>
+</header>
+
+<main class="max-w-5xl mx-auto p-3 pb-24"></main>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 hidden px-4 py-2 rounded-lg text-white text-sm shadow-lg"></div>
+
+<script>
+/* ============================================================
+   HUERTO KENNEDY · app (vanilla JS, sin build)
+   ============================================================ */
+const $  = (s,el=document)=>el.querySelector(s);
+const $$ = (s,el=document)=>[...el.querySelectorAll(s)];
+const main = $('main');
+const CLP = n => '$'+(Math.round(n||0)).toLocaleString('es-CL');
+const num = v => { const n=parseFloat(String(v??'').replace(',','.')); return isNaN(n)?0:n; };
+const todayISO = ()=> new Date().toISOString().slice(0,10);
+const uid = ()=> (crypto.randomUUID?crypto.randomUUID():'id'+Date.now()+Math.random());
+
+function toast(msg,ok=true){
+  const t=$('#toast'); t.textContent=msg;
+  t.className='fixed bottom-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg text-white text-sm shadow-lg '+(ok?'bg-emerald-600':'bg-red-600');
+  t.classList.remove('hidden'); setTimeout(()=>t.classList.add('hidden'),2200);
+}
+setInterval(()=>{ $('#clock').textContent=new Date().toLocaleString('es-CL',{weekday:'short',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); },1000);
+
+/* ---------- STORAGE ABSTRACTION: Supabase o localStorage ---------- */
+const useSB = SUPABASE_URL.startsWith('http') && !SUPABASE_ANON_KEY.startsWith('PEGAR');
+let sb=null;
+if(useSB){ sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY); }
+
+const LS = {
+  get:(k,def)=>{ try{return JSON.parse(localStorage.getItem('hk_'+k))??def}catch{return def} },
+  set:(k,v)=>localStorage.setItem('hk_'+k,JSON.stringify(v)),
+};
+
+// API unificada. Cada método devuelve promesa.
+const store = {
+  mode: useSB?'supabase':'local',
+
+  async productos(){
+    if(useSB){ const {data,error}=await sb.from('productos').select('*').order('nombre'); if(error)throw error; return data; }
+    return LS.get('productos', SEED_PRODUCTOS.map(p=>({id:uid(),activo:true,...p})));
+  },
+  async saveProducto(p){
+    if(useSB){
+      const row={...p}; if(!row.id) delete row.id; row.updated_at=new Date().toISOString();
+      const {data,error}=await sb.from('productos').upsert(row).select().single(); if(error)throw error; return data;
+    }
+    let arr=await this.productos(); if(!p.id){p.id=uid(); arr.push(p);} else { arr=arr.map(x=>x.id===p.id?{...x,...p}:x); } LS.set('productos',arr); return p;
+  },
+  async deleteProducto(id){
+    if(useSB){ const {error}=await sb.from('productos').delete().eq('id',id); if(error)throw error; return; }
+    LS.set('productos',(await this.productos()).filter(x=>x.id!==id));
+  },
+  async logPrecio(producto_id,tipo,precio){
+    if(useSB){ await sb.from('precio_historial').insert({producto_id,tipo,precio}); return; }
+    const h=LS.get('precio_historial',[]); h.push({id:uid(),producto_id,tipo,precio,fecha:new Date().toISOString()}); LS.set('precio_historial',h);
+  },
+
+  async crearVenta(header,items){
+    if(useSB){
+      const {data:v,error:e1}=await sb.from('ventas').insert(header).select().single(); if(e1)throw e1;
+      const rows=items.map(it=>({...it,venta_id:v.id})); const {error:e2}=await sb.from('venta_items').insert(rows); if(e2)throw e2; return v;
+    }
+    const ventas=LS.get('ventas',[]); const vi=LS.get('venta_items',[]);
+    const v={id:uid(),created_at:new Date().toISOString(),...header}; ventas.push(v);
+    items.forEach(it=>vi.push({id:uid(),venta_id:v.id,...it})); LS.set('ventas',ventas); LS.set('venta_items',vi); return v;
+  },
+  async ventasItems(desde,hasta){ // devuelve items con fecha de venta, para dashboard
+    if(useSB){
+      const {data,error}=await sb.from('venta_items').select('*, ventas!inner(fecha,total)').gte('ventas.fecha',desde).lte('ventas.fecha',hasta); if(error)throw error;
+      return data.map(r=>({...r,fecha:r.ventas.fecha}));
+    }
+    const ventas=LS.get('ventas',[]); const map=Object.fromEntries(ventas.map(v=>[v.id,v.fecha]));
+    return LS.get('venta_items',[]).map(it=>({...it,fecha:map[it.venta_id]})).filter(it=>it.fecha>=desde&&it.fecha<=hasta);
+  },
+  async ventasRecientes(n=20){
+    if(useSB){ const {data,error}=await sb.from('ventas').select('*').order('created_at',{ascending:false}).limit(n); if(error)throw error; return data; }
+    return LS.get('ventas',[]).sort((a,b)=>b.created_at.localeCompare(a.created_at)).slice(0,n);
+  },
+
+  async crearCompra(header,items){
+    if(useSB){
+      const {data:c,error:e1}=await sb.from('compras').insert(header).select().single(); if(e1)throw e1;
+      const rows=items.map(it=>({...it,compra_id:c.id})); const {error:e2}=await sb.from('compra_items').insert(rows); if(e2)throw e2; return c;
+    }
+    const compras=LS.get('compras',[]); const ci=LS.get('compra_items',[]);
+    const c={id:uid(),created_at:new Date().toISOString(),...header}; compras.push(c);
+    items.forEach(it=>ci.push({id:uid(),compra_id:c.id,...it})); LS.set('compras',compras); LS.set('compra_items',ci); return c;
+  },
+  async comprasRecientes(n=30){
+    if(useSB){ const {data,error}=await sb.from('compra_items').select('*, compras!inner(fecha,proveedor)').order('id',{ascending:false}).limit(n); if(error)throw error; return data.map(r=>({...r,fecha:r.compras.fecha,proveedor:r.compras.proveedor})); }
+    const compras=LS.get('compras',[]); const map=Object.fromEntries(compras.map(c=>[c.id,c]));
+    return LS.get('compra_items',[]).slice(-n).reverse().map(it=>({...it,fecha:map[it.compra_id]?.fecha,proveedor:map[it.compra_id]?.proveedor}));
+  },
+
+  async crearMerma(m){
+    if(useSB){ const {data,error}=await sb.from('merma').insert(m).select().single(); if(error)throw error; return data; }
+    const arr=LS.get('merma',[]); const row={id:uid(),created_at:new Date().toISOString(),...m}; arr.push(row); LS.set('merma',arr); return row;
+  },
+  async mermas(n=50){
+    if(useSB){ const {data,error}=await sb.from('merma').select('*').order('fecha',{ascending:false}).limit(n); if(error)throw error; return data; }
+    return LS.get('merma',[]).sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||'')).slice(0,n);
+  },
+
+  async conversiones(){
+    if(useSB){ const {data,error}=await sb.from('conversiones').select('*').order('formato'); if(error)throw error; return data; }
+    return LS.get('conversiones', SEED_CONVERSIONES.map(c=>({id:uid(),...c})));
+  },
+  async saveConversion(c){
+    if(useSB){ const row={...c}; if(!row.id)delete row.id; const {data,error}=await sb.from('conversiones').upsert(row).select().single(); if(error)throw error; return data; }
+    let arr=await this.conversiones(); if(!c.id){c.id=uid();arr.push(c);}else arr=arr.map(x=>x.id===c.id?{...x,...c}:x); LS.set('conversiones',arr); return c;
+  },
+};
+</script>
+
+<script>
+/* ---------- SEED para MODO LOCAL (en Supabase los datos vienen de la BBDD) ---------- */
+const SEED_PRODUCTOS = [{"nombre": "Ajo  x5 un", "codigo": 10016, "formato": "Unidad", "precio_venta": 1000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Albahaca", "codigo": 50011, "formato": "Unidad", "precio_venta": 1200, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Alcachofa", "codigo": 31, "formato": "Unidad", "precio_venta": 1200, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Apio Bastones", "codigo": 133, "formato": "Unidad", "precio_venta": 1990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Arandanos 125 gr", "codigo": 125, "formato": "Unidad", "precio_venta": 3000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Berenjena", "codigo": 20, "formato": "Unidad", "precio_venta": 900, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Brocoli", "codigo": 30004, "formato": "Unidad", "precio_venta": 1990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Camote peruano", "codigo": 33, "formato": "Peso", "precio_venta": 3090, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Cebolla blanca", "codigo": 137, "formato": "Peso", "precio_venta": 1590, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Cebolla morada", "codigo": 10011, "formato": "Peso", "precio_venta": 1990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Cebollin", "codigo": 23, "formato": "Unidad", "precio_venta": 1000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Champiñon", "codigo": 46, "formato": "Unidad", "precio_venta": 1890, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Cilantro", "codigo": 42, "formato": "Unidad", "precio_venta": 990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Ciruela", "codigo": 68, "formato": "Peso", "precio_venta": 2490, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Coliflor", "codigo": 30003, "formato": "Unidad", "precio_venta": 1800, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Corazon costina", "codigo": 165, "formato": "Unidad", "precio_venta": 2500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Espinaca 500 grs", "codigo": 162, "formato": "Unidad", "precio_venta": 1990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Frutilla 300gr", "codigo": 95, "formato": "Unidad", "precio_venta": 3000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Huevo x 12", "codigo": 97, "formato": "Unidad", "precio_venta": 4800, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Huevo x 30", "codigo": 30001, "formato": "Unidad", "precio_venta": 10500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Huevo x 6", "codigo": 96, "formato": "Unidad", "precio_venta": 2500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Huevos x 15", "codigo": 160, "formato": "Unidad", "precio_venta": 5500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Jengibre", "codigo": 34, "formato": "Peso", "precio_venta": 15000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Kiwi", "codigo": 6, "formato": "Peso", "precio_venta": 3590, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Lechuga Escarola", "codigo": 112, "formato": "Unidad", "precio_venta": 1890, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Limon", "codigo": 10003, "formato": "Peso", "precio_venta": 1790, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Limon sutil", "codigo": 7, "formato": "Peso", "precio_venta": 3980, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Mandarina", "codigo": 9, "formato": "Peso", "precio_venta": 2500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Mango", "codigo": 10, "formato": "Peso", "precio_venta": 3690, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Manzana fuji", "codigo": 11, "formato": "Peso", "precio_venta": 2490, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Manzana pink lady", "codigo": 98, "formato": "Peso", "precio_venta": 2490, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Manzana verde", "codigo": 12, "formato": "Peso", "precio_venta": 2390, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Membrillo", "codigo": 13, "formato": "Peso", "precio_venta": 2490, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Menta", "codigo": 50, "formato": "Unidad", "precio_venta": 1200, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Miel", "codigo": 60010, "formato": "Unidad", "precio_venta": 8500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Naranja Valencia", "codigo": 10024, "formato": "Peso", "precio_venta": 2190, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Palta hass", "codigo": 10002, "formato": "Peso", "precio_venta": 6500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Papa", "codigo": 4, "formato": "Peso", "precio_venta": 1590, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pepino ensalada", "codigo": 39, "formato": "Unidad", "precio_venta": 700, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pepino fruta", "codigo": 14, "formato": "Peso", "precio_venta": 3490, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pera", "codigo": 20003, "formato": "Peso", "precio_venta": 2200, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Perejil", "codigo": 43, "formato": "Unidad", "precio_venta": 790, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pimenton rojo", "codigo": 10008, "formato": "Unidad", "precio_venta": 1200, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pimenton verde", "codigo": 10007, "formato": "Unidad", "precio_venta": 1000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Platano", "codigo": 10025, "formato": "Peso", "precio_venta": 1950, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pomelo", "codigo": 16, "formato": "Peso", "precio_venta": 1900, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Tomate", "codigo": 10001, "formato": "Peso", "precio_venta": 1990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Tomate Cherry 500 gr", "codigo": 30002, "formato": "Unidad", "precio_venta": 2500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Uva Verde x Peso", "codigo": 65, "formato": "Peso", "precio_venta": 5990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Zanahoria", "codigo": 10005, "formato": "Peso", "precio_venta": 1190, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Zapallo entero", "codigo": null, "formato": "Unidad", "precio_venta": 5000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Zapallo italiano", "codigo": 10009, "formato": "Unidad", "precio_venta": 1000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Alfajor", "codigo": 216, "formato": "Unidad", "precio_venta": 1500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Cuchufli", "codigo": 158, "formato": "Unidad", "precio_venta": 1500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Cachito", "codigo": 189, "formato": "Unidad", "precio_venta": 1750, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Nuez 100 grs", "codigo": 84, "formato": "Unidad", "precio_venta": 2000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Almendra 100 grs", "codigo": 81, "formato": "Unidad", "precio_venta": 2200, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pistachos 100 grs", "codigo": 76, "formato": "Unidad", "precio_venta": 3000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Platano oferta", "codigo": 19, "formato": "Peso", "precio_venta": 1000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Huevo duro", "codigo": 110001, "formato": "Unidad", "precio_venta": 500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Palta Oferta", "codigo": 114, "formato": "Peso", "precio_venta": 3990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Bandeja Lechuga Escarola", "codigo": 126, "formato": "Unidad", "precio_venta": 3000, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Carbón", "codigo": 55002, "formato": "Unidad", "precio_venta": 3500, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pasta de choclo", "codigo": 801, "formato": "Unidad", "precio_venta": 3400, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Porotos granados", "codigo": 802, "formato": "Unidad", "precio_venta": 4990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Arvejas", "codigo": 803, "formato": "Unidad", "precio_venta": 2690, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Jardinera", "codigo": 804, "formato": "Unidad", "precio_venta": 2890, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Hortalizas", "codigo": 805, "formato": "Unidad", "precio_venta": 3490, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Choclo congelado", "codigo": 806, "formato": "Unidad", "precio_venta": 2550, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Papas prefritas", "codigo": 807, "formato": "Unidad", "precio_venta": 3990, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Empanadas congeladas", "codigo": 808, "formato": "Unidad", "precio_venta": 6700, "precio_compra": null, "categoria": "Verdura/Fruta"}, {"nombre": "Pasta de choclo", "codigo": null, "formato": "Unidad", "precio_venta": 3400, "precio_compra": 2100, "categoria": "Congelados"}, {"nombre": "Porotos granados", "codigo": null, "formato": "Unidad", "precio_venta": 4990, "precio_compra": 3213, "categoria": "Congelados"}, {"nombre": "Arvejas", "codigo": null, "formato": "Unidad", "precio_venta": 2690, "precio_compra": 1613, "categoria": "Congelados"}, {"nombre": "Jardinera", "codigo": null, "formato": "Unidad", "precio_venta": 2890, "precio_compra": 1775, "categoria": "Congelados"}, {"nombre": "Hortalizas", "codigo": null, "formato": "Unidad", "precio_venta": 3490, "precio_compra": 2113, "categoria": "Congelados"}, {"nombre": "Choclo", "codigo": null, "formato": "Unidad", "precio_venta": 2550, "precio_compra": 1600, "categoria": "Congelados"}, {"nombre": "Papas prefritas", "codigo": null, "formato": "Unidad", "precio_venta": 3990, "precio_compra": 1537, "categoria": "Congelados"}, {"nombre": "Empanadas (48)", "codigo": null, "formato": "Unidad", "precio_venta": 6700, "precio_compra": 3938, "categoria": "Congelados"}];
+const SEED_CONVERSIONES = [{"formato": "saco papa", "kg": 25}, {"formato": "saco cebolla", "kg": 25}, {"formato": "malla cebolla", "kg": 20}, {"formato": "saco zanahoria", "kg": 20}, {"formato": "malla zanahoria", "kg": 20}, {"formato": "caja tomate", "kg": 18}, {"formato": "caja palta", "kg": 10}, {"formato": "caja manzana", "kg": 18}, {"formato": "caja naranja", "kg": 18}, {"formato": "caja pera", "kg": 18}, {"formato": "caja limon", "kg": 18}, {"formato": "caja mandarina", "kg": 10}, {"formato": "caja kiwi", "kg": 10}, {"formato": "caja uva", "kg": 8}, {"formato": "bandeja frutilla", "kg": 0.5}, {"formato": "caja frutilla", "kg": 6}, {"formato": "atado acelga", "kg": 0.5}, {"formato": "atado espinaca", "kg": 0.5}, {"formato": "malla limon", "kg": 5}, {"formato": "malla naranja", "kg": 10}, {"formato": "docena", "kg": 12}, {"formato": "unidad", "kg": 1}];
+</script>
+
+<script>
+/* ============================================================
+   ROUTER + estado global
+   ============================================================ */
+let PRODS=[];               // cache de productos
+let CONVS=[];               // cache de conversiones
+const cart=[];              // carrito de venta actual
+
+$('#modeBadge').textContent = store.mode==='supabase' ? '● conectado a base de datos' : '● modo local (sin BBDD) — ver README';
+
+async function refreshProds(){ PRODS = await store.productos(); }
+async function refreshConvs(){ CONVS = await store.conversiones(); }
+
+const tabs={ vender:renderVender, productos:renderProductos, compras:renderCompras, merma:renderMerma, dashboard:renderDashboard };
+async function go(tab){
+  $$('.tab').forEach(b=>b.classList.toggle('tab-active',b.dataset.tab===tab));
+  $$('.tab').forEach(b=>{ if(b.dataset.tab!==tab) b.classList.add('bg-white'); else b.classList.remove('bg-white'); });
+  main.innerHTML='<div class="text-center py-20 text-slate-400">cargando…</div>';
+  try{ await tabs[tab](); }catch(e){ main.innerHTML='<div class="bg-red-100 text-red-700 p-4 rounded">Error: '+e.message+'</div>'; console.error(e); }
+}
+$$('.tab').forEach(b=>b.onclick=()=>go(b.dataset.tab));
+
+/* ============================================================
+   1) VENDER
+   ============================================================ */
+let ventaSubmode='seleccionar';
+async function renderVender(){
+  await refreshProds();
+  main.innerHTML = `
+  <div class="grid md:grid-cols-3 gap-3">
+    <div class="md:col-span-2 space-y-3">
+      <div class="flex gap-1 bg-white rounded-lg p-1 text-sm shadow-sm">
+        ${['seleccionar','escanear','foto'].map(m=>`<button data-sub="${m}" class="subm flex-1 py-2 rounded-md font-medium capitalize">${m==='seleccionar'?'🔎 Seleccionar':m==='escanear'?'📷 Escanear':'🖼️ Foto'}</button>`).join('')}
+      </div>
+      <div id="subview"></div>
+    </div>
+    <!-- CARRITO -->
+    <div class="bg-white rounded-xl shadow-sm p-3 h-fit sticky top-32">
+      <div class="font-bold mb-2 flex justify-between">Venta actual <span id="cartCount" class="text-slate-400 text-sm"></span></div>
+      <div id="cartList" class="space-y-2 max-h-[45vh] overflow-y-auto"></div>
+      <div class="border-t mt-2 pt-2 flex justify-between text-lg font-bold">Total <span id="cartTotal">$0</span></div>
+      <div class="mt-2 grid grid-cols-2 gap-2">
+        <select id="medioPago" class="border rounded-lg px-2 py-2 text-sm col-span-2">
+          <option value="efectivo">Efectivo</option><option value="tarjeta">Tarjeta</option><option value="transferencia">Transferencia</option>
+        </select>
+        <button id="btnClear" class="py-2 rounded-lg bg-slate-100 text-slate-600 text-sm">Vaciar</button>
+        <button id="btnPagar" class="py-2 rounded-lg bg-[var(--verde)] text-white font-bold text-sm">Cobrar</button>
+      </div>
+    </div>
+  </div>`;
+  $$('.subm').forEach(b=>b.onclick=()=>{ventaSubmode=b.dataset.sub; paintSubmode();});
+  $('#btnClear').onclick=()=>{cart.length=0;paintCart();};
+  $('#btnPagar').onclick=pagar;
+  paintSubmode(); paintCart();
+}
+
+function paintSubmode(){
+  $$('.subm').forEach(b=>{const a=b.dataset.sub===ventaSubmode; b.classList.toggle('bg-[var(--verde)]',a); b.classList.toggle('text-white',a);});
+  const v=$('#subview');
+  if(ventaSubmode==='seleccionar') return paintSeleccionar(v);
+  if(ventaSubmode==='escanear')    return paintEscanear(v);
+  if(ventaSubmode==='foto')        return paintFoto(v);
+}
+
+function paintSeleccionar(v){
+  v.innerHTML=`
+    <input id="qProd" placeholder="Buscar producto o código…" class="w-full border rounded-lg px-3 py-2 mb-2 shadow-sm">
+    <div id="prodGrid" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>`;
+  const grid=$('#prodGrid');
+  const paint=(f='')=>{
+    const q=f.toLowerCase();
+    grid.innerHTML = PRODS.filter(p=>p.activo!==false && (p.nombre.toLowerCase().includes(q)||String(p.codigo||'').includes(q)))
+      .map(p=>`<button class="pcard text-left bg-white rounded-lg p-2 shadow-sm active:scale-95 transition" data-id="${p.id}">
+        <div class="text-sm font-medium leading-tight">${p.nombre}</div>
+        <div class="text-xs text-slate-400">${p.formato==='Peso'?'por kg':'unidad'} · ${p.codigo??'—'}</div>
+        <div class="text-[var(--verde2)] font-bold text-sm mt-1">${CLP(p.precio_venta)}</div>
+      </button>`).join('') || '<div class="col-span-full text-center text-slate-400 py-8">Sin resultados</div>';
+    $$('.pcard',grid).forEach(b=>b.onclick=()=>addToCart(b.dataset.id));
+  };
+  paint(); $('#qProd').oninput=e=>paint(e.target.value);
+}
+
+function addToCart(id, cantidad=null){
+  const p=PRODS.find(x=>x.id===id); if(!p)return;
+  if(p.formato==='Peso' && cantidad===null){
+    const kg=prompt(`${p.nombre} — kg vendidos:`,'1'); if(kg===null)return; cantidad=num(kg); if(cantidad<=0)return;
+  } else if(cantidad===null){ cantidad=1; }
+  const ex=cart.find(c=>c.id===id);
+  if(ex && p.formato!=='Peso'){ ex.cantidad+=cantidad; }
+  else if(ex && p.formato==='Peso'){ ex.cantidad=cantidad; }
+  else cart.push({id:p.id,nombre:p.nombre,codigo:p.codigo,formato:p.formato,precio:p.precio_venta,compra:p.precio_compra,cantidad});
+  paintCart(); toast(p.nombre+' agregado');
+}
+function paintCart(){
+  const list=$('#cartList'); if(!list)return;
+  if(!cart.length){ list.innerHTML='<div class="text-slate-400 text-sm text-center py-6">Carrito vacío</div>'; }
+  else list.innerHTML=cart.map((c,i)=>{
+    const imp=Math.round(c.precio*c.cantidad);
+    return `<div class="flex items-center gap-2 text-sm">
+      <div class="flex-1"><div class="font-medium leading-tight">${c.nombre}</div>
+        <div class="text-xs text-slate-400">${CLP(c.precio)} × 
+          <input data-i="${i}" class="qty w-16 border rounded px-1 text-center" value="${c.cantidad}"> ${c.formato==='Peso'?'kg':'un'}</div>
+      </div>
+      <div class="font-semibold">${CLP(imp)}</div>
+      <button data-del="${i}" class="text-red-400 px-1">✕</button></div>`;
+  }).join('');
+  $$('.qty',list).forEach(inp=>inp.onchange=e=>{cart[e.target.dataset.i].cantidad=num(e.target.value);paintCart();});
+  $$('[data-del]',list).forEach(b=>b.onclick=()=>{cart.splice(+b.dataset.del,1);paintCart();});
+  const total=cart.reduce((s,c)=>s+c.precio*c.cantidad,0);
+  $('#cartTotal').textContent=CLP(total); $('#cartCount').textContent=cart.length?`${cart.length} ítems`:'';
+}
+async function pagar(){
+  if(!cart.length){toast('Carrito vacío',false);return;}
+  const total=Math.round(cart.reduce((s,c)=>s+c.precio*c.cantidad,0));
+  const items=cart.map(c=>({producto_id:isUUID(c.id)?c.id:null,codigo_snapshot:c.codigo??null,nombre_snapshot:c.nombre,
+    formato:c.formato,cantidad:c.cantidad,precio_unitario:Math.round(c.precio),
+    precio_compra_snapshot:c.compra??null,importe:Math.round(c.precio*c.cantidad)}));
+  try{
+    await store.crearVenta({fecha:todayISO(),total,medio_pago:$('#medioPago').value,origen:ventaSubmode==='foto'?'foto':(ventaSubmode==='escanear'?'scan':'manual')},items);
+    toast('Venta registrada '+CLP(total)); cart.length=0; paintCart();
+  }catch(e){toast('Error al guardar: '+e.message,false);}
+}
+const isUUID=s=>/^[0-9a-f]{8}-[0-9a-f]{4}-/.test(String(s));
+
+/* ----- Escanear con cámara (barcode -> match por codigo) ----- */
+let scanner=null;
+function paintEscanear(v){
+  v.innerHTML=`<div class="bg-white rounded-xl shadow-sm p-3">
+    <div id="reader" class="rounded-lg overflow-hidden"></div>
+    <p class="text-xs text-slate-400 mt-2">Apunta al código de barras. Se busca por el campo <b>código</b> del producto.</p>
+    <input id="manualCode" placeholder="…o escribe el código y Enter" class="w-full border rounded-lg px-3 py-2 mt-2">
+  </div>`;
+  $('#manualCode').onkeydown=e=>{ if(e.key==='Enter'){ matchCode(e.target.value.trim()); e.target.value=''; } };
+  if(typeof Html5Qrcode==='undefined'){ $('#reader').innerHTML='<div class="text-slate-400 text-sm p-4 text-center">Escáner no disponible</div>'; return; }
+  scanner=new Html5Qrcode('reader');
+  scanner.start({facingMode:'environment'},{fps:10,qrbox:{width:250,height:150}},
+    txt=>{ matchCode(txt); },()=>{}).catch(()=>{ $('#reader').innerHTML='<div class="text-slate-400 text-sm p-4 text-center">No se pudo abrir la cámara (permiso denegado o navegador sin soporte)</div>'; });
+}
+function matchCode(code){
+  const c=code.replace(/^0+/,''); // quita ceros a la izquierda
+  const p=PRODS.find(x=>String(x.codigo)===code||String(x.codigo)===c);
+  if(p){ addToCart(p.id); } else toast('Código '+code+' no encontrado',false);
+}
+// detener cámara al cambiar de submodo/tab
+const _paintSubmode=paintSubmode;
+paintSubmode=function(){ if(scanner){scanner.stop().catch(()=>{});scanner=null;} _paintSubmode(); };
+
+/* ----- Foto de lo vendido (requiere Edge Function) ----- */
+function paintFoto(v){
+  const ready = store.mode==='supabase';
+  v.innerHTML=`<div class="bg-white rounded-xl shadow-sm p-4">
+    <p class="text-sm mb-3">Saca o sube una foto del ticket / lista de lo vendido. La IA lo lee y llena el carrito para que revises antes de cobrar.</p>
+    <input id="foto" type="file" accept="image/*" capture="environment" class="block w-full text-sm mb-3">
+    <button id="btnFoto" class="px-4 py-2 rounded-lg bg-[var(--verde)] text-white font-bold text-sm ${ready?'':'opacity-50'}" ${ready?'':'disabled'}>Analizar foto</button>
+    ${ready?'':'<p class="text-xs text-amber-600 mt-3">⚠️ Requiere Supabase + Edge Function <code>analizar-venta</code> configurada (ver README). En modo local no está disponible.</p>'}
+    <div id="fotoStatus" class="text-sm text-slate-500 mt-3"></div>
+  </div>`;
+  if(!ready)return;
+  $('#btnFoto').onclick=async()=>{
+    const f=$('#foto').files[0]; if(!f){toast('Elige una foto',false);return;}
+    $('#fotoStatus').textContent='Leyendo imagen…';
+    const b64=await fileToB64(f);
+    try{
+      const {data,error}=await sb.functions.invoke('analizar-venta',{body:{image:b64, productos:PRODS.map(p=>({id:p.id,codigo:p.codigo,nombre:p.nombre,formato:p.formato,precio:p.precio_venta}))}});
+      if(error)throw error;
+      const items=data.items||[];
+      if(!items.length){$('#fotoStatus').textContent='No se detectaron productos.';return;}
+      items.forEach(it=>{ const p=PRODS.find(x=>x.id===it.producto_id)||PRODS.find(x=>String(x.codigo)===String(it.codigo)); if(p) addToCart(p.id,it.cantidad); });
+      ventaSubmode='seleccionar'; paintSubmode();
+      toast(items.length+' productos cargados, revisa el carrito');
+    }catch(e){ $('#fotoStatus').textContent='Error: '+e.message; }
+  };
+}
+const fileToB64=f=>new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=rej;r.readAsDataURL(f);});
+</script>
+
+<script>
+/* ============================================================
+   2) PRODUCTOS  (CRUD + edición de precios/código/nombre)
+   ============================================================ */
+async function renderProductos(){
+  await refreshProds();
+  main.innerHTML=`
+   <div class="bg-white rounded-xl shadow-sm p-3">
+    <div class="flex flex-wrap gap-2 items-center mb-3">
+      <input id="qp" placeholder="Buscar…" class="border rounded-lg px-3 py-2 text-sm flex-1 min-w-[160px]">
+      <button id="addProd" class="px-3 py-2 rounded-lg bg-[var(--verde)] text-white text-sm font-bold">+ Producto</button>
+    </div>
+    <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-left text-slate-400 border-b">
+        <tr><th class="py-2 pr-2">Producto</th><th class="pr-2">Código</th><th class="pr-2">Formato</th>
+        <th class="pr-2 text-right">P. venta</th><th class="pr-2 text-right">P. compra</th><th class="pr-2 text-right">Margen</th><th></th></tr>
+      </thead><tbody id="prodBody"></tbody>
+    </table></div>
+   </div>`;
+  const paint=(f='')=>{
+    const q=f.toLowerCase();
+    $('#prodBody').innerHTML=PRODS.filter(p=>p.nombre.toLowerCase().includes(q)||String(p.codigo||'').includes(q)).map(p=>{
+      const mg = p.precio_compra? Math.round((1-p.precio_compra/p.precio_venta)*100):null;
+      return `<tr class="border-b last:border-0 ${p.activo===false?'opacity-40':''}" data-id="${p.id}">
+        <td class="py-1 pr-2"><input class="e nombre w-full border-0 focus:bg-yellow-50 rounded px-1" value="${p.nombre}"></td>
+        <td class="pr-2"><input class="e codigo w-20 border-0 focus:bg-yellow-50 rounded px-1" value="${p.codigo??''}"></td>
+        <td class="pr-2"><select class="e formato border-0 bg-transparent"><option ${p.formato==='Unidad'?'selected':''}>Unidad</option><option ${p.formato==='Peso'?'selected':''}>Peso</option></select></td>
+        <td class="pr-2"><input class="e precio_venta w-24 text-right border-0 focus:bg-yellow-50 rounded px-1" value="${p.precio_venta}"></td>
+        <td class="pr-2"><input class="e precio_compra w-24 text-right border-0 focus:bg-yellow-50 rounded px-1" value="${p.precio_compra??''}"></td>
+        <td class="pr-2 text-right ${mg!==null&&mg<0?'text-red-600 font-bold':'text-slate-500'}">${mg!==null?mg+'%':'—'}</td>
+        <td class="text-right whitespace-nowrap">
+          <button class="save text-emerald-600 px-1" title="Guardar">💾</button>
+          <button class="del text-red-400 px-1" title="Eliminar">🗑️</button></td>
+      </tr>`;
+    }).join('');
+    $$('#prodBody tr').forEach(tr=>{
+      tr.querySelector('.save').onclick=()=>saveRow(tr);
+      tr.querySelector('.del').onclick=()=>delRow(tr);
+    });
+  };
+  paint(); $('#qp').oninput=e=>paint(e.target.value);
+  $('#addProd').onclick=async()=>{ await store.saveProducto({nombre:'Nuevo producto',codigo:null,formato:'Unidad',precio_venta:0,precio_compra:null,categoria:'Verdura/Fruta',activo:true}); await renderProductos(); };
+
+  async function saveRow(tr){
+    const id=tr.dataset.id; const old=PRODS.find(p=>p.id===id);
+    const g=cls=>tr.querySelector('.'+cls).value;
+    const upd={id, nombre:g('nombre').trim(), codigo:g('codigo')?parseInt(g('codigo')):null, formato:g('formato'),
+      precio_venta:Math.round(num(g('precio_venta'))), precio_compra:g('precio_compra')?Math.round(num(g('precio_compra'))):null};
+    try{
+      await store.saveProducto(upd);
+      if(old && old.precio_venta!==upd.precio_venta) await store.logPrecio(id,'venta',upd.precio_venta);
+      if(old && old.precio_compra!==upd.precio_compra && upd.precio_compra!=null) await store.logPrecio(id,'compra',upd.precio_compra);
+      toast('Guardado'); await refreshProds(); paint($('#qp').value);
+    }catch(e){toast('Error: '+e.message,false);}
+  }
+  async function delRow(tr){ if(!confirm('¿Eliminar producto?'))return; try{await store.deleteProducto(tr.dataset.id);toast('Eliminado');await renderProductos();}catch(e){toast('Error: '+e.message,false);} }
+}
+</script>
+
+<script>
+/* ============================================================
+   3) COMPRAS  (formato -> kg, costo unitario por kg)
+   ============================================================ */
+async function renderCompras(){
+  await refreshProds(); await refreshConvs();
+  main.innerHTML=`
+  <div class="grid md:grid-cols-2 gap-3">
+    <div class="bg-white rounded-xl shadow-sm p-4 space-y-3">
+      <div class="font-bold">Registrar compra</div>
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <label class="col-span-1">Fecha<input id="cFecha" type="date" value="${todayISO()}" class="w-full border rounded-lg px-2 py-2"></label>
+        <label class="col-span-1">Proveedor<input id="cProv" placeholder="opcional" class="w-full border rounded-lg px-2 py-2"></label>
+      </div>
+      <hr>
+      <div class="text-sm font-medium text-slate-500">Ítem</div>
+      <label class="text-sm block">Producto
+        <input id="iProd" list="prodList" placeholder="ej: Zanahoria" class="w-full border rounded-lg px-2 py-2">
+        <datalist id="prodList">${PRODS.map(p=>`<option value="${p.nombre}">`).join('')}</datalist>
+      </label>
+      <div class="grid grid-cols-3 gap-2 text-sm">
+        <label>Formato
+          <input id="iFormato" list="fmtList" placeholder="saco…" class="w-full border rounded-lg px-2 py-2">
+          <datalist id="fmtList">${CONVS.map(c=>`<option value="${c.formato}">`).join('')}</datalist>
+        </label>
+        <label>Cantidad<input id="iCant" type="number" step="0.01" value="1" class="w-full border rounded-lg px-2 py-2"></label>
+        <label>kg c/u<input id="iKg" type="number" step="0.01" placeholder="auto" class="w-full border rounded-lg px-2 py-2"></label>
+      </div>
+      <label class="text-sm block">Costo total pagado (CLP)<input id="iCosto" type="number" class="w-full border rounded-lg px-2 py-2"></label>
+      <div id="convPrev" class="text-xs bg-emerald-50 text-emerald-800 rounded-lg p-2"></div>
+      <label class="text-sm flex items-center gap-2"><input id="iUpd" type="checkbox" checked> Actualizar precio de compra del producto</label>
+      <div class="flex gap-2">
+        <button id="addItem" class="flex-1 py-2 rounded-lg bg-slate-100 text-sm font-medium">+ Agregar ítem</button>
+        <button id="saveCompra" class="flex-1 py-2 rounded-lg bg-[var(--verde)] text-white text-sm font-bold">Guardar compra</button>
+      </div>
+      <div id="itemsBuf" class="space-y-1 text-sm"></div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm p-4">
+      <div class="font-bold mb-2">Últimas compras</div>
+      <div id="compHist" class="text-sm space-y-1 max-h-[70vh] overflow-y-auto"></div>
+    </div>
+  </div>`;
+
+  const buf=[];
+  const kgAuto=()=>{ const f=$('#iFormato').value.trim().toLowerCase(); const c=CONVS.find(x=>x.formato.toLowerCase()===f); return c?c.kg:null; };
+  const preview=()=>{
+    const cant=num($('#iCant').value); const kg=num($('#iKg').value)||kgAuto()||0; const costo=num($('#iCosto').value);
+    const kgEq=cant*kg; const cu=kgEq>0?Math.round(costo/kgEq):0;
+    $('#convPrev').innerHTML = kg? `≈ <b>${kgEq.toLocaleString('es-CL')} kg</b> totales · costo <b>${CLP(cu)}/kg</b>` : 'Escribe un formato conocido o el "kg c/u" manual.';
+    return {kgEq,cu,kg};
+  };
+  ['iFormato','iCant','iKg','iCosto'].forEach(id=>$('#'+id).addEventListener('input',preview)); preview();
+
+  $('#addItem').onclick=()=>{
+    const nombre=$('#iProd').value.trim(); if(!nombre){toast('Falta producto',false);return;}
+    const {kgEq,cu,kg}=preview(); const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase());
+    buf.push({producto_id:p?.id||null, nombre, formato_compra:$('#iFormato').value.trim()||null,
+      cantidad_bruta:num($('#iCant').value), kg_por_formato:kg||null, kg_equivalente:kgEq,
+      costo_total:Math.round(num($('#iCosto').value)), costo_unitario_kg:cu, _upd:$('#iUpd').checked});
+    paintBuf(); $('#iProd').value='';$('#iFormato').value='';$('#iCant').value='1';$('#iKg').value='';$('#iCosto').value=''; preview();
+  };
+  function paintBuf(){ $('#itemsBuf').innerHTML=buf.map((b,i)=>`<div class="flex justify-between bg-slate-50 rounded px-2 py-1">
+    <span>${b.nombre} · ${b.cantidad_bruta}${b.formato_compra?' '+b.formato_compra:''} (${b.kg_equivalente}kg)</span>
+    <span>${CLP(b.costo_total)} · ${CLP(b.costo_unitario_kg)}/kg <button data-d="${i}" class="text-red-400 ml-1">✕</button></span></div>`).join('');
+    $$('#itemsBuf [data-d]').forEach(x=>x.onclick=()=>{buf.splice(+x.dataset.d,1);paintBuf();}); }
+
+  $('#saveCompra').onclick=async()=>{
+    if(!buf.length){toast('Agrega al menos un ítem',false);return;}
+    const total=buf.reduce((s,b)=>s+b.costo_total,0);
+    try{
+      await store.crearCompra({fecha:$('#cFecha').value,proveedor:$('#cProv').value||null,total},
+        buf.map(({_upd,...rest})=>rest));
+      for(const b of buf){ if(b._upd && b.producto_id && b.costo_unitario_kg){ await store.saveProducto({id:b.producto_id,precio_compra:b.costo_unitario_kg}); await store.logPrecio(b.producto_id,'compra',b.costo_unitario_kg); } }
+      toast('Compra guardada '+CLP(total)); buf.length=0; paintBuf(); await refreshProds(); loadHist();
+    }catch(e){toast('Error: '+e.message,false);}
+  };
+
+  async function loadHist(){ const h=await store.comprasRecientes(40);
+    $('#compHist').innerHTML=h.map(c=>`<div class="border-b last:border-0 py-1"><div class="flex justify-between"><span class="font-medium">${c.nombre}</span><span>${CLP(c.costo_total)}</span></div>
+      <div class="text-xs text-slate-400">${c.fecha||''} · ${c.kg_equivalente}kg · ${CLP(c.costo_unitario_kg)}/kg${c.proveedor?' · '+c.proveedor:''}</div></div>`).join('')||'<div class="text-slate-400">Sin compras</div>'; }
+  loadHist();
+}
+</script>
+
+<script>
+/* ============================================================
+   4) MERMA
+   ============================================================ */
+async function renderMerma(){
+  await refreshProds();
+  main.innerHTML=`
+  <div class="grid md:grid-cols-2 gap-3">
+    <div class="bg-white rounded-xl shadow-sm p-4 space-y-3">
+      <div class="font-bold">Anotar merma</div>
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <label>Fecha<input id="mFecha" type="date" value="${todayISO()}" class="w-full border rounded-lg px-2 py-2"></label>
+        <label>Producto<input id="mProd" list="mList" class="w-full border rounded-lg px-2 py-2"><datalist id="mList">${PRODS.map(p=>`<option value="${p.nombre}">`).join('')}</datalist></label>
+        <label>Cantidad<input id="mCant" type="number" step="0.01" class="w-full border rounded-lg px-2 py-2"></label>
+        <label>Unidad<select id="mUnid" class="w-full border rounded-lg px-2 py-2"><option value="kg">kg</option><option value="un">unidades</option></select></label>
+      </div>
+      <label class="text-sm block">Motivo<input id="mMotivo" placeholder="opcional (podrido, golpeado…)" class="w-full border rounded-lg px-2 py-2"></label>
+      <div id="mPrev" class="text-xs bg-red-50 text-red-700 rounded-lg p-2"></div>
+      <button id="mSave" class="w-full py-2 rounded-lg bg-[var(--verde)] text-white font-bold text-sm">Registrar merma</button>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm p-4">
+      <div class="font-bold mb-2">Merma reciente</div>
+      <div id="mHist" class="text-sm space-y-1 max-h-[70vh] overflow-y-auto"></div>
+    </div>
+  </div>`;
+  const prev=()=>{ const p=PRODS.find(x=>x.nombre.toLowerCase()===$('#mProd').value.trim().toLowerCase());
+    const costo=p&&p.precio_compra?Math.round(p.precio_compra*num($('#mCant').value)):null;
+    $('#mPrev').textContent = costo!=null?`Costo estimado de la pérdida: ${CLP(costo)}`:'Sin precio de compra cargado para estimar el costo.'; return costo; };
+  ['mProd','mCant'].forEach(id=>$('#'+id).addEventListener('input',prev)); prev();
+  $('#mSave').onclick=async()=>{
+    const nombre=$('#mProd').value.trim(); if(!nombre||!num($('#mCant').value)){toast('Falta producto o cantidad',false);return;}
+    const p=PRODS.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase());
+    try{ await store.crearMerma({fecha:$('#mFecha').value,producto_id:p?.id||null,nombre,cantidad:num($('#mCant').value),unidad:$('#mUnid').value,motivo:$('#mMotivo').value||null,costo_estimado:prev()});
+      toast('Merma registrada'); $('#mProd').value='';$('#mCant').value='';$('#mMotivo').value='';prev(); loadH();
+    }catch(e){toast('Error: '+e.message,false);}
+  };
+  async function loadH(){ const h=await store.mermas(60);
+    $('#mHist').innerHTML=h.map(m=>`<div class="border-b last:border-0 py-1 flex justify-between"><span>${m.nombre} <span class="text-slate-400 text-xs">${m.cantidad}${m.unidad}${m.motivo?' · '+m.motivo:''}</span></span><span class="text-xs text-slate-400">${m.fecha}${m.costo_estimado?' · '+CLP(m.costo_estimado):''}</span></div>`).join('')||'<div class="text-slate-400">Sin registros</div>'; }
+  loadH();
+}
+
+/* ============================================================
+   5) DASHBOARD  (rentabilidad por producto)
+   ============================================================ */
+async function renderDashboard(){
+  const hasta=todayISO(); const d=new Date(); d.setDate(d.getDate()-30); const desde=d.toISOString().slice(0,10);
+  main.innerHTML=`
+   <div class="bg-white rounded-xl shadow-sm p-3 mb-3 flex flex-wrap gap-2 items-end text-sm">
+     <label>Desde<input id="dDesde" type="date" value="${desde}" class="block border rounded-lg px-2 py-2"></label>
+     <label>Hasta<input id="dHasta" type="date" value="${hasta}" class="block border rounded-lg px-2 py-2"></label>
+     <button id="dGo" class="px-4 py-2 rounded-lg bg-[var(--verde)] text-white font-bold">Actualizar</button>
+   </div>
+   <div id="kpis" class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3"></div>
+   <div class="grid lg:grid-cols-2 gap-3 mb-3">
+     <div class="bg-white rounded-xl shadow-sm p-3"><div class="font-bold text-emerald-700 mb-2">🏆 Más ganan ($ margen)</div><div id="topWin"></div></div>
+     <div class="bg-white rounded-xl shadow-sm p-3"><div class="font-bold text-red-600 mb-2">🩸 Pierden o margen bajo</div><div id="topLose"></div></div>
+   </div>
+   <div class="bg-white rounded-xl shadow-sm p-3 overflow-x-auto">
+     <div class="font-bold mb-2">Detalle por producto</div>
+     <table class="w-full text-sm"><thead class="text-left text-slate-400 border-b">
+       <tr><th class="py-2 pr-2">Producto</th><th class="text-right pr-2">Vendido</th><th class="text-right pr-2">Ingresos</th><th class="text-right pr-2">Costo</th><th class="text-right pr-2">Margen $</th><th class="text-right">Margen %</th></tr>
+     </thead><tbody id="dBody"></tbody></table>
+   </div>`;
+  $('#dGo').onclick=load; await load();
+
+  async function load(){
+    const items=await store.ventasItems($('#dDesde').value,$('#dHasta').value);
+    const map={};
+    items.forEach(it=>{
+      const k=it.nombre_snapshot;
+      map[k]=map[k]||{nombre:k,cant:0,ing:0,cost:0};
+      map[k].cant+=num(it.cantidad); map[k].ing+=it.importe;
+      map[k].cost+=num(it.cantidad)*(it.precio_compra_snapshot||0);
+    });
+    const rows=Object.values(map).map(r=>({...r,margen:r.ing-r.cost,mpct:r.ing?(r.ing-r.cost)/r.ing*100:0})).sort((a,b)=>b.margen-a.margen);
+    const tIng=rows.reduce((s,r)=>s+r.ing,0), tCost=rows.reduce((s,r)=>s+r.cost,0), tMg=tIng-tCost;
+    const sinCosto=rows.filter(r=>r.cost===0&&r.ing>0).length;
+    $('#kpis').innerHTML=[
+      ['Ingresos',CLP(tIng),'text-slate-800'],['Costo (COGS)',CLP(tCost),'text-slate-800'],
+      ['Margen bruto',CLP(tMg),tMg>=0?'text-emerald-600':'text-red-600'],
+      ['Margen %',(tIng?Math.round(tMg/tIng*100):0)+'%',tMg>=0?'text-emerald-600':'text-red-600']
+    ].map(([l,v,c])=>`<div class="bg-white rounded-xl shadow-sm p-3"><div class="text-xs text-slate-400">${l}</div><div class="text-xl font-bold ${c}">${v}</div></div>`).join('');
+
+    const bar=(r,max)=>`<div class="flex items-center gap-2 py-1 text-sm"><div class="w-28 truncate">${r.nombre}</div>
+      <div class="flex-1 bg-slate-100 rounded h-4 relative"><div class="h-4 rounded ${r.margen>=0?'bg-emerald-400':'bg-red-400'}" style="width:${Math.max(4,Math.abs(r.margen)/max*100)}%"></div></div>
+      <div class="w-20 text-right ${r.margen<0?'text-red-600':''}">${CLP(r.margen)}</div></div>`;
+    const maxAbs=Math.max(1,...rows.map(r=>Math.abs(r.margen)));
+    $('#topWin').innerHTML=rows.slice(0,8).map(r=>bar(r,maxAbs)).join('')||'<div class="text-slate-400 text-sm">Sin ventas en el rango</div>';
+    $('#topLose').innerHTML=[...rows].reverse().slice(0,8).map(r=>bar(r,maxAbs)).join('')||'<div class="text-slate-400 text-sm">—</div>';
+
+    $('#dBody').innerHTML=rows.map(r=>`<tr class="border-b last:border-0">
+      <td class="py-1 pr-2">${r.nombre}</td><td class="text-right pr-2">${r.cant.toLocaleString('es-CL')}</td>
+      <td class="text-right pr-2">${CLP(r.ing)}</td><td class="text-right pr-2 ${r.cost===0?'text-amber-500':''}">${CLP(r.cost)}</td>
+      <td class="text-right pr-2 font-semibold ${r.margen<0?'text-red-600':'text-emerald-700'}">${CLP(r.margen)}</td>
+      <td class="text-right ${r.mpct<0?'text-red-600':''}">${Math.round(r.mpct)}%</td></tr>`).join('')||'<tr><td colspan="6" class="text-center text-slate-400 py-6">Sin ventas en el rango</td></tr>';
+    if(sinCosto) toast(sinCosto+' producto(s) sin costo cargado — el margen los sobreestima',false);
+  }
+}
+
+/* ---------- init ---------- */
+go('vender');
+</script>
+</body>
+</html>
